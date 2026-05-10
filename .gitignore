@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Secrets — NEVER commit
+.env
+.env.*
+infrastructure-secrets.env
+infrastructure/secrets.env
+*.pem
+*.key
+
+# Local data (only used for smoke tests; prod uses Cloud SQL)
+data/*.db
+data/*.db-journal
+
+# Build artefacts
+*.log
+.ruff_cache/
+
+# OS
+.DS_Store
