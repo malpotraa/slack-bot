@@ -152,7 +152,7 @@ You'll need accounts and apps configured at:
 | Service | Why | Cost |
 |---|---|---|
 | **Slack** workspace (admin) | Bot + slash commands + per-user OAuth | Free |
-| **Google Cloud** project | Hosting + Calendar OAuth client | $300 trial credit |
+| **Google Cloud** project | Hosting + Calendar OAuth client | Pay as Use |
 | **Wrike** account (admin) | OAuth app for Wrike REST | Free trial |
 | **Anthropic** account | Claude API key | Pay-as-you-go |
 | **Arize Phoenix** Cloud | Trace ingestion (optional) | Free tier |
@@ -454,7 +454,6 @@ Built with:
 - [Anthropic Claude](https://www.anthropic.com/claude)
 - [slack-bolt](https://slack.dev/bolt-python/)
 - [Arize Phoenix](https://phoenix.arize.com)
-- [SQLModel](https://sqlmodel.tiangolo.com/) by [@tiangolo](https://github.com/tiangolo)
 - [uv](https://docs.astral.sh/uv/) by [Astral](https://astral.sh)
 
 ---
