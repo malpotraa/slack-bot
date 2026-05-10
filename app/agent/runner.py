@@ -77,6 +77,32 @@ def _set_session_attrs(
 StreamCallback = Callable[[str], Awaitable[None]]
 
 
+def _clean_assistant_block(bd: dict[str, Any]) -> dict[str, Any]:
+    """Strip SDK-side extra fields before round-tripping into the next request.
+
+    Newer Anthropic SDK versions decorate text blocks with extras like
+    `parsed_output`, `citations`, etc. The API rejects those on inbound
+    messages with "Extra inputs are not permitted". Keep only the fields
+    Anthropic accepts per block type.
+    """
+    t = bd.get("type")
+    if t == "text":
+        return {"type": "text", "text": bd.get("text", "")}
+    if t == "tool_use":
+        return {
+            "type": "tool_use",
+            "id": bd.get("id"),
+            "name": bd.get("name"),
+            "input": bd.get("input", {}),
+        }
+    if t == "thinking":
+        # Extended-thinking blocks must be passed back verbatim if you use
+        # them; we currently don't, but be safe.
+        return {k: v for k, v in bd.items() if k in {"type", "thinking", "signature"}}
+    # Unknown — pass through; Anthropic will tell us if it's wrong.
+    return bd
+
+
 async def run_agent_turn(
     *,
     user_id: int,
@@ -184,17 +210,20 @@ async def run_agent_turn(
                     total_cache_read_tokens += cache_read
                     total_cache_create_tokens += cache_create
 
-            # Process final message blocks
+            # Process final message blocks. We clean SDK-decorated extras off
+            # text/tool_use blocks before appending them to the messages list
+            # so the NEXT iteration's request body is accepted by the API.
             assistant_blocks: list[dict[str, Any]] = []
             tool_uses: list[dict[str, Any]] = []
             text_parts: list[str] = []
             for block in final.content:
                 bd = block.model_dump()
-                assistant_blocks.append(bd)
-                if bd.get("type") == "tool_use":
-                    tool_uses.append(bd)
-                elif bd.get("type") == "text":
-                    text_parts.append(bd.get("text", ""))
+                cleaned = _clean_assistant_block(bd)
+                assistant_blocks.append(cleaned)
+                if cleaned.get("type") == "tool_use":
+                    tool_uses.append(cleaned)
+                elif cleaned.get("type") == "text":
+                    text_parts.append(cleaned.get("text", ""))
             messages.append({"role": "assistant", "content": assistant_blocks})
 
             if final.stop_reason != "tool_use" or not tool_uses:

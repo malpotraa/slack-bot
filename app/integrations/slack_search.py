@@ -158,22 +158,35 @@ async def find_unreplied_mentions(
             if not channel or not ts:
                 return True
 
-            # Did user post in the same thread?
+            # If the matched message is itself a thread reply, conversations.replies
+            # needs the THREAD PARENT's ts to return the whole thread. Using the
+            # reply's own ts only returns that single reply, which would make us
+            # think the user never replied (when in fact they did, elsewhere in
+            # the thread). The match's `thread_ts` field, when present, points to
+            # the parent — fall back to `ts` if it's missing (then this match IS
+            # the parent).
+            thread_root_ts = match.get("thread_ts") or ts
+
+            # Did user post anywhere in this thread?
             try:
                 replies = await user_client.conversations_replies(
-                    channel=channel, ts=ts, limit=200
+                    channel=channel, ts=thread_root_ts, limit=200
                 )
                 for r in replies.get("messages", []):
-                    if r.get("ts") == ts:
-                        continue
+                    # The user authored ANY message in this thread → replied.
                     if r.get("user") == slack_user_id:
                         return True
             except SlackApiError as exc:
-                # Common: not_in_channel — fall through, can't determine
-                if exc.response.get("error") not in ("not_in_channel", "channel_not_found"):
+                # not_in_channel / channel_not_found / thread_not_found —
+                # fall through, can't determine from thread context.
+                if exc.response.get("error") not in (
+                    "not_in_channel",
+                    "channel_not_found",
+                    "thread_not_found",
+                ):
                     logger.warning(f"replies fetch failed: {exc.response.get('error')}")
 
-            # Reactions on the message itself
+            # Reactions on the matched message itself count as ack
             try:
                 rxn = await bot_client.reactions_get(channel=channel, timestamp=ts)
                 msg = (rxn.get("message") or {})

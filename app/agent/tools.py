@@ -181,6 +181,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    # ─── User settings (meta) ───
+    {
+        "name": "update_working_hours",
+        "description": (
+            "Set the user's working-hours window (HH:MM 24-hour). Used by "
+            "/goodmorning and /wrike to compute busy/free time. Single window "
+            "applied to every day (per-day support is a future enhancement). "
+            "Call FIRST with confirmed=false for preview, then confirmed=true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["work_start", "work_end", "confirmed"],
+            "properties": {
+                "work_start": {
+                    "type": "string",
+                    "description": "Start of workday, HH:MM 24-hour. e.g. '08:00'.",
+                },
+                "work_end": {
+                    "type": "string",
+                    "description": "End of workday, HH:MM 24-hour. e.g. '16:00'.",
+                },
+                "confirmed": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "get_working_hours",
+        "description": "Read the user's currently saved working-hours window.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -216,6 +246,10 @@ async def dispatch_tool(
         return await _search_unreplied_mentions(
             inputs, user_id=user_id, slack_user_id=slack_user_id, bot_token=slack_bot_token
         )
+    if name == "update_working_hours":
+        return await _update_working_hours(inputs, user_id=user_id)
+    if name == "get_working_hours":
+        return await _get_working_hours(user_id=user_id)
     raise ValueError(f"Unknown / disallowed tool: {name}")
 
 
@@ -515,6 +549,86 @@ async def _search_unreplied_mentions(
             for m in mentions
         ],
     }
+
+
+# ── User settings ──────────────────────────────────────────────────────────
+
+
+import re as _re
+
+_HHMM = _re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})$")
+
+
+def _normalize_hhmm(s: str) -> str | None:
+    """'8:00' / '08:00' / '16:00' → 'HH:MM' 24-hour. Returns None if invalid."""
+    if not s:
+        return None
+    m = _HHMM.match(s.strip())
+    if not m:
+        return None
+    h = int(m.group("h"))
+    minute = int(m.group("m"))
+    if not (0 <= h <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{h:02d}:{minute:02d}"
+
+
+async def _update_working_hours(inputs: dict, *, user_id: int) -> dict:
+    work_start = _normalize_hhmm(inputs.get("work_start") or "")
+    work_end = _normalize_hhmm(inputs.get("work_end") or "")
+    confirmed = bool(inputs.get("confirmed"))
+
+    if not work_start or not work_end:
+        return {
+            "error": (
+                "Times must be HH:MM 24-hour, e.g. '08:00' and '16:00'. "
+                "Please rephrase with valid times."
+            )
+        }
+    if work_start >= work_end:
+        return {"error": "Start time must be earlier than end time."}
+
+    if not confirmed:
+        return {
+            "preview": True,
+            "summary_for_user": (
+                f"Update your working hours to {work_start}–{work_end}. "
+                "This affects /goodmorning and /wrike free-slot math."
+            ),
+            "next_action": (
+                "If the user approves, call update_working_hours again with the "
+                "same arguments and confirmed=true."
+            ),
+        }
+
+    from app.db.engine import session_scope
+    from app.db.models import User
+
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return {"error": "User not found."}
+        user.workday_start = work_start
+        user.workday_end = work_end
+        session.add(user)
+
+    return {
+        "ok": True,
+        "work_start": work_start,
+        "work_end": work_end,
+        "message": f"Working hours saved: {work_start}–{work_end}.",
+    }
+
+
+async def _get_working_hours(*, user_id: int) -> dict:
+    from app.db.engine import session_scope
+    from app.db.models import User
+
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return {"error": "User not found."}
+        return {"work_start": user.workday_start, "work_end": user.workday_end}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
