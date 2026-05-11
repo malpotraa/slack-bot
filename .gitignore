@@ -27,3 +27,6 @@ data/*.db-journal
 
 # OS
 .DS_Store
+
+# Documentation
+claude.md

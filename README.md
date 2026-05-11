@@ -454,8 +454,8 @@ Built with:
 - [Anthropic Claude](https://www.anthropic.com/claude)
 - [slack-bolt](https://slack.dev/bolt-python/)
 - [Arize Phoenix](https://phoenix.arize.com)
-- [uv](https://docs.astral.sh/uv/) by [Astral](https://astral.sh)
+- [uv](https://docs.astral.sh/uv/)
 
 ---
 
-*Last updated 2026-05-10 · Document version 1.0*
+*Last updated 2026-05-10 · Document version 1.1*
