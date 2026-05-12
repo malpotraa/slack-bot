@@ -120,11 +120,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "get_wrike_task",
-        "description": "Fetch full details of one Wrike task by id. Read-only.",
+        "description": (
+            "Fetch full details of one Wrike task. Read-only. Accept EITHER an "
+            "alphanumeric API id (like 'IEAA4BCD') in `task_id` OR a Wrike URL "
+            "the user pasted (like 'https://www.wrike.com/workspace.htm?...id=4449467731...') "
+            "in `task_ref`. Always prefer `task_ref` when the user provides a URL."
+        ),
         "input_schema": {
             "type": "object",
-            "required": ["task_id"],
-            "properties": {"task_id": {"type": "string"}},
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD').",
+                },
+                "task_ref": {
+                    "type": "string",
+                    "description": (
+                        "Any Wrike URL the user pasted. Will be resolved server-side "
+                        "to the API task id."
+                    ),
+                },
+            },
         },
     },
     # ─── Wrike (write — restricted) ───
@@ -133,16 +149,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Propose or change the custom status of a Wrike task. Call FIRST with "
             "confirmed=false for a preview. After user approves, call again with "
-            "confirmed=true. Cannot create, rename, or delete tasks — status only."
+            "confirmed=true. Cannot create, rename, or delete tasks — status only. "
+            "Accept EITHER an alphanumeric `task_id` OR a Wrike URL in `task_ref`."
         ),
         "input_schema": {
             "type": "object",
-            "required": ["task_id", "new_status_name", "confirmed"],
+            "required": ["new_status_name", "confirmed"],
             "properties": {
-                "task_id": {"type": "string"},
+                "task_id": {
+                    "type": "string",
+                    "description": "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD').",
+                },
+                "task_ref": {
+                    "type": "string",
+                    "description": "Wrike URL the user pasted (resolved server-side).",
+                },
                 "new_status_name": {
                     "type": "string",
-                    "description": "Target status name as it appears in Wrike, e.g. 'In Progress'.",
+                    "description": "Target status name as it appears in Wrike, e.g. 'In Progress', 'Completed'.",
                 },
                 "confirmed": {"type": "boolean"},
             },
@@ -152,13 +176,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "post_wrike_task_comment",
         "description": (
             "Propose or post a comment on a Wrike task. Call FIRST with confirmed=false "
-            "to preview the exact text. After user approves, call again with confirmed=true."
+            "to preview the exact text. After user approves, call again with confirmed=true. "
+            "Accept EITHER `task_id` OR a Wrike URL in `task_ref`."
         ),
         "input_schema": {
             "type": "object",
-            "required": ["task_id", "text", "confirmed"],
+            "required": ["text", "confirmed"],
             "properties": {
                 "task_id": {"type": "string"},
+                "task_ref": {"type": "string"},
                 "text": {"type": "string"},
                 "confirmed": {"type": "boolean"},
             },
@@ -178,6 +204,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "integer",
                     "description": "Lookback window in days. Default 7. Max 30.",
                 },
+            },
+        },
+    },
+    # ─── Internal: drives /wrike approval-button card ───
+    {
+        "name": "schedule_wrike_task",
+        "description": (
+            "Plot a Wrike task onto Google Calendar and mark the task as "
+            "'Accepted & Scheduled' in Wrike. Used by the /wrike approval card. "
+            "Atomic from the user's perspective: one click does both. "
+            "Call with confirmed=false for preview, then confirmed=true to execute."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["task_id", "title", "start_iso", "end_iso", "tz_name", "confirmed"],
+            "properties": {
+                "task_id": {"type": "string", "description": "Wrike alphanumeric task id."},
+                "title": {"type": "string"},
+                "permalink": {"type": "string"},
+                "description_extra": {"type": "string"},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+                "tz_name": {"type": "string"},
+                "confirmed": {"type": "boolean"},
             },
         },
     },
@@ -250,6 +300,8 @@ async def dispatch_tool(
         return await _update_working_hours(inputs, user_id=user_id)
     if name == "get_working_hours":
         return await _get_working_hours(user_id=user_id)
+    if name == "schedule_wrike_task":
+        return await _schedule_wrike_task(inputs, user_id=user_id)
     raise ValueError(f"Unknown / disallowed tool: {name}")
 
 
@@ -446,34 +498,52 @@ async def _list_wrike_tasks(inputs: dict, *, user_id: int) -> dict:
     }
 
 
+async def _resolve_wrike_task(
+    client: "wrike_int.WrikeClient", inputs: dict
+) -> dict | None:
+    """Look up a Wrike task using whichever ref the LLM supplied (id or URL)."""
+    task_id = (inputs.get("task_id") or "").strip()
+    task_ref = (inputs.get("task_ref") or "").strip()
+    if task_ref:
+        return await client.resolve_task_ref(task_ref)
+    if task_id:
+        # If the LLM passed a URL into task_id by mistake, still handle it.
+        return await client.resolve_task_ref(task_id)
+    return None
+
+
 async def _get_wrike_task(inputs: dict, *, user_id: int) -> dict:
     client = await wrike_int.WrikeClient.for_user(user_id)
-    t = await client.task(inputs["task_id"], fields=["description", "responsibleIds"])
+    t = await _resolve_wrike_task(client, inputs)
     if not t:
-        return {"error": f"Wrike task {inputs['task_id']!r} not found."}
+        return {
+            "error": (
+                "Wrike task not found. Pass either an alphanumeric API id "
+                "(e.g. 'IEAA4BCD') as `task_id`, or a Wrike URL as `task_ref`."
+            )
+        }
     return _summarize_task(t)
 
 
 async def _update_wrike_task_status(inputs: dict, *, user_id: int) -> dict:
-    task_id = inputs["task_id"]
     new_name = inputs["new_status_name"]
     confirmed = bool(inputs.get("confirmed"))
 
     client = await wrike_int.WrikeClient.for_user(user_id)
-    task = await client.task(task_id)
+    task = await _resolve_wrike_task(client, inputs)
     if not task:
-        return {"error": f"Wrike task {task_id!r} not found."}
+        return {
+            "error": (
+                "Wrike task not found. Pass either an alphanumeric API id "
+                "as `task_id`, or a Wrike URL as `task_ref`."
+            )
+        }
 
     new_ids = await wrike_int.resolve_status_ids(user_id, new_name)
     if not new_ids:
         return {"error": f"No status named {new_name!r} in this workspace."}
 
-    # Choose the status ID that lives in the SAME workflow as the task.
     target_id = new_ids[0]
-    task_status_id = task.get("customStatusId")
-    if task_status_id and len(new_ids) > 1:
-        # Best-effort match; if we can't, fall back to first.
-        target_id = new_ids[0]
 
     if not confirmed:
         return {
@@ -485,35 +555,43 @@ async def _update_wrike_task_status(inputs: dict, *, user_id: int) -> dict:
                 "If the user approves, call update_wrike_task_status again with "
                 "confirmed=true."
             ),
+            "_resolved_task_id": task.get("id"),
         }
 
-    await client.update_task_status(task_id, custom_status_id=target_id)
+    await client.update_task_status(task["id"], custom_status_id=target_id)
     return {"ok": True, "message": f"Updated {task.get('title')!r} → {new_name}."}
 
 
 async def _post_wrike_task_comment(inputs: dict, *, user_id: int) -> dict:
-    task_id = inputs["task_id"]
-    text = inputs["text"].strip()
+    text = (inputs.get("text") or "").strip()
     confirmed = bool(inputs.get("confirmed"))
+    if not text:
+        return {"error": "Comment text is empty."}
 
     client = await wrike_int.WrikeClient.for_user(user_id)
-    task = await client.task(task_id)
+    task = await _resolve_wrike_task(client, inputs)
     if not task:
-        return {"error": f"Wrike task {task_id!r} not found."}
+        return {
+            "error": (
+                "Wrike task not found. Pass either an alphanumeric API id "
+                "as `task_id`, or a Wrike URL as `task_ref`."
+            )
+        }
 
     if not confirmed:
         return {
             "preview": True,
             "summary_for_user": (
-                f"Post comment on “{task.get('title')}”:\n\n> {text}"
+                f"Post this comment on “{task.get('title')}”:\n> {text}"
             ),
             "next_action": (
                 "If the user approves, call post_wrike_task_comment again with the "
                 "same text and confirmed=true."
             ),
+            "_resolved_task_id": task.get("id"),
         }
 
-    await client.post_task_comment(task_id, text=text)
+    await client.post_task_comment(task["id"], text=text)
     return {"ok": True, "message": f"Comment posted on {task.get('title')!r}."}
 
 
@@ -548,6 +626,94 @@ async def _search_unreplied_mentions(
             }
             for m in mentions
         ],
+    }
+
+
+# ── /wrike scheduler (event + status update) ───────────────────────────────
+
+
+SCHEDULED_STATUS_NAME = "Accepted & Scheduled"
+
+
+async def _schedule_wrike_task(inputs: dict, *, user_id: int) -> dict:
+    """Create a calendar event for a Wrike task AND set the task's status
+    to 'Accepted & Scheduled'. Atomic from the user's perspective.
+    """
+    from datetime import datetime as _dt
+
+    task_id = (inputs.get("task_id") or "").strip()
+    title = (inputs.get("title") or "").strip()
+    permalink = (inputs.get("permalink") or "").strip()
+    description_extra = (inputs.get("description_extra") or "").strip()
+    tz_name = inputs.get("tz_name") or "UTC"
+    confirmed = bool(inputs.get("confirmed"))
+
+    if not task_id or not title:
+        return {"error": "Missing task_id or title."}
+    if not inputs.get("start_iso") or not inputs.get("end_iso"):
+        return {"error": "Missing start_iso / end_iso."}
+
+    try:
+        start = _parse_dt(inputs["start_iso"], tz_name)
+        end = _parse_dt(inputs["end_iso"], tz_name)
+    except Exception as exc:
+        return {"error": f"Could not parse times: {exc}"}
+
+    if not confirmed:
+        return {
+            "preview": True,
+            "summary_for_user": (
+                f"Schedule *{title}* — "
+                f"{start.strftime('%a %b %-d, %-I:%M%p')}–"
+                f"{end.strftime('%-I:%M%p')}. "
+                f"Also marks the Wrike task as *{SCHEDULED_STATUS_NAME}*."
+            ),
+            "next_action": "On approval, runs with confirmed=true.",
+        }
+
+    description = (
+        f"Wrike task: {title}\n"
+        f"Permalink: {permalink}\n\n"
+        f"{description_extra}\n\n"
+        f"— Scheduled via Slack /wrike at {_dt.utcnow().isoformat()}Z"
+    )
+
+    # 1. Create the calendar event
+    try:
+        event = await gcal.create_event(
+            user_id,
+            summary=title,
+            description=description,
+            start=start,
+            end=end,
+            tz_name=tz_name,
+            extended_properties={"wrikeTaskId": task_id, "createdBy": "slack-assistant"},
+            source_title="Wrike task",
+            source_url=permalink,
+        )
+    except Exception as exc:
+        return {"error": f"Failed to create Calendar event: {exc}"}
+
+    # 2. Update Wrike task status — best-effort; calendar event already created
+    status_msg = ""
+    try:
+        new_ids = await wrike_int.resolve_status_ids(user_id, SCHEDULED_STATUS_NAME)
+        if not new_ids:
+            status_msg = (
+                f" (couldn't update Wrike: status {SCHEDULED_STATUS_NAME!r} not "
+                f"found in your workspace)"
+            )
+        else:
+            client = await wrike_int.WrikeClient.for_user(user_id)
+            await client.update_task_status(task_id, custom_status_id=new_ids[0])
+    except Exception as exc:
+        status_msg = f" (Calendar event created; Wrike status update failed: {exc})"
+
+    return {
+        "ok": True,
+        "event_id": event.get("id"),
+        "html_link": event.get("htmlLink"),
+        "message": f"Scheduled *{title}* and marked as {SCHEDULED_STATUS_NAME}.{status_msg}",
     }
 
 

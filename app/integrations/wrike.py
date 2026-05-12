@@ -121,6 +121,46 @@ class WrikeClient:
         data = (await self._get(f"/tasks/{task_id}", params=params)).get("data") or []
         return data[0] if data else None
 
+    async def task_by_permalink(
+        self, url: str, *, fields: list[str] | None = None
+    ) -> dict | None:
+        """Resolve a Wrike task URL (any format) to the actual task.
+
+        Wrike URLs come in many shapes:
+          https://www.wrike.com/open.htm?id=4449467731
+          https://www.wrike.com/workspace.htm?acc=4789758#/task-view?id=4449467731&pid=...
+          https://app-eu.wrike.com/...#id=4449467731...
+
+        Wrike's API needs the canonical permalink form. We extract the numeric
+        id and rebuild as https://www.wrike.com/open.htm?id=<id>, then call
+        GET /tasks?permalink=<url>.
+        """
+        import re
+        from urllib.parse import quote
+
+        m = re.search(r"[?&#/]id=(\d+)", url)
+        if not m:
+            return None
+        canonical = f"https://www.wrike.com/open.htm?id={m.group(1)}"
+        params: dict[str, Any] = {"permalink": canonical}
+        if fields:
+            params["fields"] = json.dumps(fields)
+        # Note: httpx will URL-encode params automatically. Keep canonical raw.
+        _ = quote  # silence unused-import warning if we ever stop using it
+        data = (await self._get("/tasks", params=params)).get("data") or []
+        return data[0] if data else None
+
+    async def resolve_task_ref(self, ref: str) -> dict | None:
+        """Accept either a Wrike URL or an alphanumeric API task ID and return the task.
+
+        Lets the agent be lenient about what the user pastes.
+        """
+        if not ref:
+            return None
+        if ref.startswith("http://") or ref.startswith("https://"):
+            return await self.task_by_permalink(ref)
+        return await self.task(ref)
+
     async def update_task_status(self, task_id: str, *, custom_status_id: str) -> dict | None:
         params = {"customStatus": custom_status_id}
         data = (await self._put(f"/tasks/{task_id}", params=params)).get("data") or []

@@ -113,6 +113,7 @@ async def run_agent_turn(
     workday_end: str,
     history: list[dict[str, Any]],
     user_message: str,
+    extra_system_context: str | None = None,
     slack_user_id: str = "",
     slack_team_id: str = "",
     slack_bot_token: str | None = None,
@@ -120,7 +121,7 @@ async def run_agent_turn(
     thread_ts: str = "",
     max_tool_iterations: int = 3,
     on_stream_chunk: StreamCallback | None = None,
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
     """Run one user turn through Claude with streaming + prompt caching.
 
     `on_stream_chunk(accumulated_text)` is invoked on every text delta. The
@@ -135,13 +136,17 @@ async def run_agent_turn(
         work_start=workday_start,
         work_end=workday_end,
     )
-    system = [
+    system_blocks: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": system_text,
             "cache_control": {"type": "ephemeral"},
         }
     ]
+    # Per-turn extra context (e.g. "the user is in a /wrike thread, here are
+    # the tasks they see"). Not cache-marked because it varies per turn.
+    if extra_system_context:
+        system_blocks.append({"type": "text", "text": extra_system_context})
     tools = _tools_with_caching()
 
     messages: list[dict[str, Any]] = list(history) + [
@@ -165,6 +170,9 @@ async def run_agent_turn(
         span.set_attribute("agent.history_messages", len(history))
 
         tools_used: list[str] = []
+        # Tools that returned preview=True become pending_actions; the caller
+        # builds an Approve / Disapprove card for each.
+        pending_actions: list[dict[str, Any]] = []
         total_input_tokens = 0
         total_output_tokens = 0
         total_cache_read_tokens = 0
@@ -178,7 +186,7 @@ async def run_agent_turn(
                 async with _client().messages.stream(
                     model=settings.agent_model,
                     max_tokens=2048,
-                    system=system,
+                    system=system_blocks,
                     tools=tools,
                     messages=messages,
                 ) as stream:
@@ -242,7 +250,7 @@ async def run_agent_turn(
                 span.set_attribute(
                     "llm.token_count.cache_create_total", total_cache_create_tokens
                 )
-                return final_text or "(no response)"
+                return (final_text or "(no response)", pending_actions)
 
             # Tool-use round — execute tools and continue
             tool_results = []
@@ -287,6 +295,16 @@ async def run_agent_turn(
                     ts.set_attribute("output.mime_type", "application/json")
                     if isinstance(result, dict) and result.get("preview"):
                         ts.set_attribute("tool.is_preview", True)
+                        # Capture for the handler to build an Approve card.
+                        # Pass the LLM's original args plus the summary text.
+                        pending_actions.append(
+                            {
+                                "tool": tool_name,
+                                "args": tool_input,
+                                "summary": result.get("summary_for_user", ""),
+                                "resolved_task_id": result.get("_resolved_task_id"),
+                            }
+                        )
 
                 tool_results.append(
                     {
@@ -302,6 +320,6 @@ async def run_agent_turn(
         span.set_attribute("agent.iterations", max_tool_iterations)
         span.set_attribute("output.value", "(tool-iteration limit reached)")
         return (
-            "I hit my tool-use limit before finishing — try asking again more "
-            "specifically."
+            "I hit my tool-use limit before finishing — try asking again more specifically.",
+            pending_actions,
         )

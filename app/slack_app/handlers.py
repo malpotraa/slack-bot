@@ -25,6 +25,7 @@ from app.config import settings
 from app.db.engine import session_scope
 from app.db.users import get_or_create_user
 from app.sessions import store as session_store
+from app.slack_app.approval import build_approval_blocks
 from app.slack_app.commands.wrike_cmd import try_handle_wrike_thread_reply
 from app.utils.slack_mrkdwn import to_slack_mrkdwn
 
@@ -129,9 +130,12 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             logger.error("user_id None after get_or_create_user")
             return
 
-    # 1) If this is a reply inside an active /wrike state machine thread, route there.
+    # 1) If this is a reply inside an active /wrike state machine thread, try
+    # to route there. The helper may return extra_context (the task list) when
+    # the reply isn't a scheduling intent — we pass that to the agent below.
+    extra_context: str | None = None
     if event.get("thread_ts"):
-        handled = await try_handle_wrike_thread_reply(
+        handled, extra_context = await try_handle_wrike_thread_reply(
             client=client,
             user_id=user_id,
             channel_id=channel_id,
@@ -141,6 +145,8 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         if handled:
             logger.info(f"  → dispatched to /wrike state machine (user={user_id})")
             return
+        if extra_context:
+            logger.info(f"  → non-scheduling /wrike reply; forwarding to agent with task-list context")
 
     # 2) Conversational agent. Reply lands as a thread on the user's message
     #    so subsequent in-thread replies share session memory.
@@ -199,8 +205,9 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         updater = SlackStreamUpdater(client, channel_id, loading_ts)
         on_chunk = updater.push
 
+    pending_actions: list[dict] = []
     try:
-        reply = await run_agent_turn(
+        reply, pending_actions = await run_agent_turn(
             user_id=user_id,
             user_name=real_name or "there",
             user_email=email,
@@ -209,6 +216,7 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             workday_end=workday_end,
             history=history,
             user_message=text,
+            extra_system_context=extra_context,
             slack_user_id=slack_user_id,
             slack_team_id=slack_team_id,
             slack_bot_token=settings.slack_bot_token,
@@ -224,7 +232,6 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
     if updater is not None:
         await updater.finalize(reply)
     elif loading_ts:
-        # Fallback: placeholder existed but updater was never set somehow
         try:
             await client.chat_update(
                 channel=channel_id, ts=loading_ts, text=to_slack_mrkdwn(reply)
@@ -237,6 +244,23 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         await client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts, text=to_slack_mrkdwn(reply)
         )
+
+    # If the agent proposed any writes, post a separate Approve / Disapprove
+    # card in the same thread. Clicking a button runs the action.
+    if pending_actions:
+        blocks = build_approval_blocks(
+            intro_text="🔔  *Approval needed* — please review and click below.",
+            pending_actions=pending_actions,
+        )
+        try:
+            await client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="Approval needed",
+                blocks=blocks,
+            )
+        except Exception as exc:
+            logger.warning(f"failed to post approval card: {exc}")
 
     # Persist the turn so follow-ups in this thread have context.
     await session_store.append_agent_turn(

@@ -15,6 +15,7 @@ from app.integrations import wrike as wrike_int
 from app.llm.extract_schedule import extract_schedule_intent
 from app.observability import get_tracer
 from app.sessions import store as session_store
+from app.slack_app.approval import build_approval_blocks_with_alternates
 from app.utils.timezone import end_of_day, now_in, start_of_day, user_tz
 from app.utils.working_hours import (
     TimeSlot,
@@ -211,10 +212,69 @@ def register(app):
     # in the system. See app.slack_app.handlers.
 
 
+_SCHEDULE_HINTS = (
+    "schedule", "plot", "book", "calendar", "meeting", "block off",
+    "tomorrow", "today", "yesterday", "next week", "this week",
+    "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday",
+    "am ", "pm ", " am", " pm",
+    ":", "min", "hour",
+)
+_NON_SCHEDULE_HINTS = (
+    "update", "set status", "set the status", "change status", "mark",
+    "complete", "completed", "done", "in progress", "active",
+    "post", "comment", "reply on", "say on", "note on",
+)
+
+
+def _looks_like_non_scheduling(text: str, state: dict) -> bool:
+    """Heuristic: is this reply doing something other than scheduling?
+
+    If we're already mid-state-machine (e.g. waiting on overlap override),
+    the existing scheduler flow takes the reply. Otherwise, if the text
+    contains action verbs ('update status', 'mark complete', 'post comment')
+    and no obvious schedule signals (dates, times), route to the
+    conversational agent.
+    """
+    if state.get("stage") in ("AWAITING_OVERRIDE",):
+        return False
+    lower = text.lower()
+    has_action = any(kw in lower for kw in _NON_SCHEDULE_HINTS)
+    has_schedule = any(kw in lower for kw in _SCHEDULE_HINTS)
+    return has_action and not has_schedule
+
+
+def build_task_list_context(tasks: list[dict]) -> str:
+    """Build extra-system-context the conversational agent sees so it can map
+    'task #N' or 'task 15' references to the right Wrike API task_id."""
+    lines = [
+        "[Context: the user is replying inside a /wrike task list. They may "
+        "reference tasks by their list number (1-based) or by title. Resolve "
+        "any 'task #N' references to the corresponding Wrike API task_id "
+        "below, then pass that task_id to Wrike tools.]",
+        "",
+        "Task list currently shown to user:",
+    ]
+    for i, t in enumerate(tasks, start=1):
+        title = t.get("title") or "(untitled)"
+        tid = t.get("id") or "(no-id)"
+        lines.append(f"  {i}. {title}  —  task_id: {tid}")
+    return "\n".join(lines)
+
+
 async def try_handle_wrike_thread_reply(
     *, client, user_id: int, channel_id: str, thread_ts: str, user_text: str
-) -> bool:
-    """If this thread has an active /wrike state, drive the next turn. Returns True if handled."""
+) -> tuple[bool, str | None]:
+    """Process a reply inside a /wrike thread.
+
+    Returns:
+      (handled, extra_context)
+        handled=True  → this function processed the message, caller should stop
+        handled=False → caller should run the conversational agent. If
+                        extra_context is non-None, pass it as the agent's
+                        per-turn system context (so the agent can resolve
+                        'task #N' references).
+    """
     state = await session_store.get_command_state(
         user_id=user_id,
         channel_id=channel_id,
@@ -222,7 +282,13 @@ async def try_handle_wrike_thread_reply(
         command_name=SESSION_NAME,
     )
     if state is None:
-        return False
+        return False, None
+
+    # Non-scheduling intent (update status / post comment / etc) — fall back
+    # to the conversational agent, but give it the task list as context.
+    if _looks_like_non_scheduling(user_text, state):
+        ctx = build_task_list_context(state.get("tasks") or [])
+        return False, ctx
 
     await _handle_thread_turn(
         client=client,
@@ -232,7 +298,7 @@ async def try_handle_wrike_thread_reply(
         user_text=user_text,
         state=state,
     )
-    return True
+    return True, None
 
 
 # ── Step 3: state-machine turn ─────────────────────────────────────────────
@@ -250,42 +316,9 @@ async def _handle_thread_turn(
     tz_name = state["tz"]
     tasks = state["tasks"]
 
-    # Detect simple "use suggested" / "schedule anyway" / "cancel" replies first
-    lower = user_text.strip().lower()
-    if state.get("stage") == "AWAITING_OVERRIDE":
-        if lower in ("cancel", "stop", "abort"):
-            await client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts, text="Cancelled — nothing scheduled."
-            )
-            await session_store.clear_command_state(
-                user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
-            )
-            return
-        if "use suggested" in lower or "use the suggested" in lower or "use alt" in lower:
-            sug = state.get("suggested_slot")
-            if sug:
-                await _create_event_and_finish(
-                    client=client,
-                    user_id=user_id,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    state=state,
-                    start_iso=sug["start"],
-                    end_iso=sug["end"],
-                )
-                return
-        if "anyway" in lower or "force" in lower or "yes" in lower:
-            await _create_event_and_finish(
-                client=client,
-                user_id=user_id,
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                state=state,
-                start_iso=state["proposed_start"],
-                end_iso=state["proposed_end"],
-            )
-            return
-        # Otherwise fall through and re-extract — the user gave a new time.
+    # NOTE: the old AWAITING_OVERRIDE text-based flow (user types "schedule
+    # anyway" / "use suggested") has been replaced by an approval card with
+    # buttons — see the overlap branch below.
 
     # Parse intent
     intent = await extract_schedule_intent(
@@ -361,66 +394,119 @@ async def _handle_thread_turn(
             text="That's longer than 8 hours — confirm by saying *force* if you really mean it.",
         )
 
-    # If user previously said force_overlap, skip the check
-    if intent.force_overlap:
-        await _create_event_and_finish(
-            client=client,
-            user_id=user_id,
-            channel_id=channel_id,
+    # Resolve which task is being scheduled
+    idx = task_index
+    if idx is None or idx < 1 or idx > len(tasks):
+        await client.chat_postMessage(
+            channel=channel_id,
             thread_ts=thread_ts,
-            state=state,
-            start_iso=proposed_start.isoformat(),
-            end_iso=proposed_end.isoformat(),
+            text="Lost track of which task — start over with `/wrike`.",
+        )
+        await session_store.clear_command_state(
+            user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
         )
         return
+    task = tasks[idx - 1]
+    task_id = task.get("id") or ""
+    task_title = task.get("title") or "(untitled)"
+    permalink = task.get("permalink") or ""
+    task_desc = (task.get("description") or "")[:1000]
 
-    # Overlap check
-    overlapping = await _find_overlaps(user_id, proposed_start, proposed_end)
-    if overlapping:
-        suggested = first_free_slot_for_duration(
-            busy=await _busy_for_horizon(user_id, proposed_start, days=5),
-            duration_minutes=int(duration_minutes),
-            horizon_days=5,
-            workday_start=state["workday_start"],
-            workday_end=state["workday_end"],
-            tz_name=tz_name,
-            not_before=proposed_start,
-        )
-        new_state = {
-            **state,
-            "stage": "AWAITING_OVERRIDE",
-            "proposed_start": proposed_start.isoformat(),
-            "proposed_end": proposed_end.isoformat(),
-            "suggested_slot": (
-                {"start": suggested.start.isoformat(), "end": suggested.end.isoformat()}
-                if suggested
-                else None
-            ),
+    # Helper that packages the "schedule_wrike_task" tool call for the
+    # approval card's button payload.
+    def _action_for(start_dt: datetime, end_dt: datetime, summary: str) -> dict:
+        return {
+            "tool": "schedule_wrike_task",
+            "args": {
+                "task_id": task_id,
+                "title": task_title,
+                "permalink": permalink,
+                "description_extra": task_desc,
+                "start_iso": start_dt.isoformat(),
+                "end_iso": end_dt.isoformat(),
+                "tz_name": tz_name,
+            },
+            "summary": summary,
         }
-        await session_store.save_command_state(
-            user_id=user_id,
-            channel_id=channel_id,
-            thread_ts=thread_ts,
-            command_name=SESSION_NAME,
-            state=new_state,
+
+    # Overlap check (skip if force_overlap requested by extractor)
+    overlapping = (
+        [] if intent.force_overlap else await _find_overlaps(user_id, proposed_start, proposed_end)
+    )
+
+    fmt_day_time = lambda s, e: (
+        f"{s.strftime('%a %b %-d, %-I:%M%p')}–{e.strftime('%-I:%M%p')}"
+    )
+    proposed_summary = (
+        f"Schedule *{task_title}* at *{fmt_day_time(proposed_start, proposed_end)}* "
+        f"(also marks the Wrike task as *Accepted & Scheduled*)."
+    )
+
+    if not overlapping:
+        # Clean slot — single approval card
+        blocks = build_approval_blocks_with_alternates(
+            intro_text="🔔  *Approval needed* — confirm the scheduling below.",
+            primary=_action_for(proposed_start, proposed_end, proposed_summary),
         )
         await client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            blocks=wb.overlap_warning(proposed_start, proposed_end, overlapping, suggested, tz_name),
-            text="Schedule conflict",
+            text="Approval needed",
+            blocks=blocks,
+        )
+        await session_store.clear_command_state(
+            user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
         )
         return
 
-    # No conflict → create
-    await _create_event_and_finish(
-        client=client,
-        user_id=user_id,
-        channel_id=channel_id,
+    # Overlap → offer both options on one card
+    suggested = first_free_slot_for_duration(
+        busy=await _busy_for_horizon(user_id, proposed_start, days=5),
+        duration_minutes=int(duration_minutes),
+        horizon_days=5,
+        workday_start=state["workday_start"],
+        workday_end=state["workday_end"],
+        tz_name=tz_name,
+        not_before=proposed_start,
+    )
+    overlap_lines = "\n".join(
+        f"  • {ov.get('title') or '(untitled)'}" for ov in overlapping[:3]
+    )
+    intro = (
+        f"⚠️  *Overlap detected.* {fmt_day_time(proposed_start, proposed_end)} overlaps with:\n"
+        f"{overlap_lines}\n\n"
+        f"Pick one option below."
+    )
+    primary_action = _action_for(
+        proposed_start,
+        proposed_end,
+        f"*Schedule anyway* at *{fmt_day_time(proposed_start, proposed_end)}* "
+        f"(overlap will remain). Marks Wrike task as *Accepted & Scheduled*.",
+    )
+    alt_action = None
+    if suggested:
+        alt_action = _action_for(
+            suggested.start,
+            suggested.end,
+            f"*Use suggested slot* — *{fmt_day_time(suggested.start, suggested.end)}* "
+            f"(no overlap). Marks Wrike task as *Accepted & Scheduled*.",
+        )
+
+    blocks = build_approval_blocks_with_alternates(
+        intro_text=intro,
+        primary=primary_action,
+        alternate=alt_action,
+        primary_button_text="✅ Schedule anyway",
+        alternate_button_text="🔁 Use suggested slot",
+    )
+    await client.chat_postMessage(
+        channel=channel_id,
         thread_ts=thread_ts,
-        state=state,
-        start_iso=proposed_start.isoformat(),
-        end_iso=proposed_end.isoformat(),
+        text="Approval needed (overlap)",
+        blocks=blocks,
+    )
+    await session_store.clear_command_state(
+        user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
     )
 
 
@@ -457,82 +543,6 @@ async def _find_overlaps(
     return overlaps
 
 
-async def _create_event_and_finish(
-    *,
-    client,
-    user_id: int,
-    channel_id: str,
-    thread_ts: str,
-    state: dict,
-    start_iso: str,
-    end_iso: str,
-) -> None:
-    tasks = state["tasks"]
-    pending = state.get("pending_slot", {})
-    idx = pending.get("task_index")
-    if idx is None or idx < 1 or idx > len(tasks):
-        await client.chat_postMessage(
-            channel=channel_id, thread_ts=thread_ts, text="Lost track of which task — start over with `/wrike`."
-        )
-        await session_store.clear_command_state(
-            user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
-        )
-        return
-    task = tasks[idx - 1]
-    tz_name = state["tz"]
-
-    start_dt = datetime.fromisoformat(start_iso)
-    end_dt = datetime.fromisoformat(end_iso)
-
-    description = (
-        f"Wrike task: {task.get('title')}\n"
-        f"Status: New\n"
-        f"Permalink: {task.get('permalink')}\n\n"
-        f"{(task.get('description') or '')[:1000]}\n\n"
-        f"— Scheduled via Slack /wrike at {datetime.utcnow().isoformat()}Z"
-    )
-
-    tracer = get_tracer()
-    with tracer.start_as_current_span("gcal.create_event") as span:
-        span.set_attribute("wrike.task_id", task.get("id") or "")
-        span.set_attribute("duration.minutes", int((end_dt - start_dt).total_seconds() / 60))
-        span.set_attribute("override.used", state.get("stage") == "AWAITING_OVERRIDE")
-
-        try:
-            event = await gcal.create_event(
-                user_id,
-                summary=task.get("title") or "(untitled Wrike task)",
-                description=description,
-                start=start_dt,
-                end=end_dt,
-                tz_name=tz_name,
-                color_id="5",
-                extended_properties={
-                    "wrikeTaskId": task.get("id") or "",
-                    "createdBy": "slack-assistant",
-                },
-                source_title="Wrike task",
-                source_url=task.get("permalink") or "",
-            )
-        except Exception as exc:
-            logger.exception("Calendar event create failed")
-            await client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts, text=f"⚠️ Failed to create event: `{exc}`"
-            )
-            return
-
-    await client.chat_postMessage(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        blocks=wb.created_block(
-            title=task.get("title") or "Wrike task",
-            start=start_dt,
-            end=end_dt,
-            tz_name=tz_name,
-            link=task.get("permalink") or event.get("htmlLink") or "",
-        ),
-        text="Scheduled",
-    )
-    await session_store.clear_command_state(
-        user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
-    )
+# NOTE: `_create_event_and_finish` was removed when /wrike switched to the
+# approval-card flow. The actual create+status-update now happens in the
+# `schedule_wrike_task` tool, invoked by the Approve button handler.

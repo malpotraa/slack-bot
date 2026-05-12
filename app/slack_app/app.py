@@ -9,6 +9,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from app.config import settings
+from app.slack_app import approval as approval_actions
 from app.slack_app.commands import connect as connect_cmd
 from app.slack_app.commands import goodmorning as goodmorning_cmd
 from app.slack_app.commands import wrike_cmd
@@ -45,6 +46,7 @@ def create_slack_app() -> AsyncApp:
     connect_cmd.register(app)
     goodmorning_cmd.register(app)
     wrike_cmd.register(app)
+    approval_actions.register(app)
     register_message_handlers(app)
 
     @app.error
