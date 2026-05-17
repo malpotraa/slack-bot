@@ -371,11 +371,18 @@ async def _handle_thread_turn(
         h, m = (int(x) for x in start_time.split(":"))
         proposed_start = datetime.combine(d, datetime.min.time(), tzinfo=z).replace(hour=h, minute=m)
         proposed_end = proposed_start + timedelta(minutes=int(duration_minutes))
-    except Exception as exc:
+    except Exception:
+        # Date/time parse failure on user input. The exception itself is usually
+        # safe (e.g. "minute must be in 0..59"), but a generic message is safer
+        # against future codepath changes that might surface internal details.
+        logger.exception("wrike scheduling: date/time parse failed")
         await client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text=f"I couldn't parse that into a real time: `{exc}`. Try again.",
+            text=(
+                "I couldn't parse that into a real time. "
+                "Try a format like “tomorrow 9:00 for 1 hour” or “Fri 14:30 for 30 min”."
+            ),
         )
         return
 

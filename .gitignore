@@ -1,32 +1,54 @@
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[oc]
+*.egg-info/
 build/
 dist/
 wheels/
-*.egg-info
 
-# Virtual environments
+# ─── Virtual environments ────────────────────────────────────────────────
 .venv/
+venv/
 
-# Secrets — NEVER commit
+# ─── Caches / build artefacts ────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.log
+
+# ─── Secrets — NEVER commit ──────────────────────────────────────────────
 .env
+.env.local
+.env.*.local
 .env.*
+# Re-include the example file — it's a template, not a secret.
+!.env.example
 infrastructure-secrets.env
 infrastructure/secrets.env
 *.pem
 *.key
 
-# Local data (only used for smoke tests; prod uses Cloud SQL)
+# ─── Local data (smoke-test SQLite; prod uses Cloud SQL) ─────────────────
 data/*.db
 data/*.db-journal
+data/*.sqlite*
 
-# Build artefacts
-*.log
-.ruff_cache/
-
-# OS
+# ─── OS / editor ─────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
 
-# Documentation
+# ─── Runtime junk ────────────────────────────────────────────────────────
+*.pid
+*.sock
+.python-version
+
+# ─── Living-context docs that should stay local ──────────────────────────
 claude.md

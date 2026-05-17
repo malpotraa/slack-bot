@@ -13,6 +13,7 @@ import httpx
 from loguru import logger
 
 from app.config import settings
+from app.oauth._logging import safe_error_summary
 
 AUTHORIZE_URL = "https://login.wrike.com/oauth2/authorize/v4"
 TOKEN_URL = "https://login.wrike.com/oauth2/token"
@@ -42,7 +43,7 @@ async def exchange_code(code: str) -> dict:
             },
         )
         if resp.status_code != 200:
-            logger.error(f"Wrike code exchange failed {resp.status_code}: {resp.text}")
+            logger.error(f"Wrike code exchange failed: {safe_error_summary(resp)}")
         resp.raise_for_status()
         return resp.json()
 
@@ -59,7 +60,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
             },
         )
         if resp.status_code != 200:
-            logger.error(f"Wrike refresh failed {resp.status_code}: {resp.text}")
+            logger.error(f"Wrike refresh failed: {safe_error_summary(resp)}")
         resp.raise_for_status()
         return resp.json()
 

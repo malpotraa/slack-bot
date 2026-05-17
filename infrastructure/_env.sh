@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ─── Required ────────────────────────────────────────────────────────────
-export PROJECT_ID="${PROJECT_ID:-slack-marketing-bot}"        # e.g. "my-slack-assistant"
+export PROJECT_ID="${PROJECT_ID:-CHANGE-ME}"        # e.g. "my-slack-assistant"
 export REGION="${REGION:-us-central1}"
 export SERVICE_NAME="${SERVICE_NAME:-slack-assistant}"
 

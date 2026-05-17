@@ -29,6 +29,21 @@ APPROVE_ACTION_ID = "agent_approve"
 APPROVE_ALT_ACTION_ID = "agent_approve_alt"
 DISAPPROVE_ACTION_ID = "agent_disapprove"
 
+# Defense-in-depth: only these tool names may be dispatched via the approval-
+# button handler. Slack signs the outer interaction (Bolt verifies), but the
+# payload JSON we put in the button `value` is not signed by us. Restricting
+# to a known write-tool list means even a forged or replayed payload can only
+# trigger one of our intended actions — not, say, list-only tools or any
+# future tool a future change adds inadvertently.
+WRITE_TOOL_ALLOWLIST: set[str] = {
+    "create_calendar_event",
+    "update_calendar_event",
+    "update_wrike_task_status",
+    "post_wrike_task_comment",
+    "schedule_wrike_task",
+    "update_working_hours",
+}
+
 
 def build_approval_blocks(
     intro_text: str,
@@ -221,6 +236,26 @@ async def _handle_approve_click(body, client) -> None:
     )
     channel_id = body["channel"]["id"]
     message_ts = body["message"]["ts"]
+
+    # Allow-list guard: refuse to dispatch anything not on the known write-tool
+    # list, no matter what the payload says. Logs the attempt for auditability.
+    if tool_name not in WRITE_TOOL_ALLOWLIST:
+        logger.warning(
+            f"approval rejected: tool {tool_name!r} not in WRITE_TOOL_ALLOWLIST; "
+            f"clicker={slack_user_id} channel={channel_id} ts={message_ts}"
+        )
+        try:
+            await client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="⚠️ Rejected — that action isn't permitted.",
+                blocks=_settled_blocks(
+                    "⚠️", "*Rejected.* That action isn't on the allow-list."
+                ),
+            )
+        except SlackApiError as exc:
+            logger.warning(f"approve: rejection chat_update failed: {exc}")
+        return
 
     ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
     if ctx is None:

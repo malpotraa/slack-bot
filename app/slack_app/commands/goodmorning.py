@@ -261,10 +261,13 @@ def register(app):
                 text="Good morning!",
                 blocks=blocks,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("goodmorning failed")
             await client.chat_update(
                 channel=target_channel,
                 ts=loading_ts,
-                text=f"⚠️ Briefing failed: `{exc}`",
+                text=(
+                    "⚠️ Couldn't build the briefing this time. "
+                    "Trace is in Phoenix; try again in a moment."
+                ),
             )

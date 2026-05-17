@@ -224,9 +224,12 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             thread_ts=thread_ts,
             on_stream_chunk=on_chunk,
         )
-    except Exception as exc:
+    except Exception:
+        # Full traceback is captured by Phoenix + Cloud Logging via the OTel
+        # auto-instrumentation and loguru. The user-facing message stays
+        # generic so we don't leak DB schemas, internal paths, or stack frames.
         logger.exception("agent turn failed")
-        reply = f"⚠️ Something went wrong: `{exc}`"
+        reply = "⚠️ Something went wrong on my end. Try again in a moment — if it keeps failing, check the Phoenix dashboard for the trace."
 
     # Replace the placeholder with the clean final reply.
     if updater is not None:

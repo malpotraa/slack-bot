@@ -8,7 +8,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.4.1`) is what's live in Cloud Run.
+Nothing pending right now. The previous release (`v1.5.0`) is what's queued for deploy.
+
+---
+
+## [1.5.0] — 2026-05-16
+
+Security hardening pass + repo hygiene. Follows a full audit of the prod codebase.
+
+### Added
+
+- **Approval-handler tool allow-list** (`app/slack_app/approval.py`). New `WRITE_TOOL_ALLOWLIST` set restricts which tool names the Approve-button handler will dispatch, regardless of what the button payload claims. Currently allows: `create_calendar_event`, `update_calendar_event`, `update_wrike_task_status`, `post_wrike_task_comment`, `schedule_wrike_task`, `update_working_hours`. Rejected attempts are logged with `clicker / channel / message_ts` for auditability and the card updates to "⚠️ Rejected".
+- **`app/oauth/_logging.py`** (new module). `safe_error_summary(resp)` extracts `error` + `error_description` from JSON OAuth-failure responses (capped at 200 chars), or returns `status=N (non-JSON body, omitted)`. Replaces the previous "log `resp.text` verbatim" pattern.
+- **`.env.example` is now tracked** (gitignore re-includes it via `!.env.example`). It was unintentionally being captured by the broader `.env.*` rule and not landing in the repo for new contributors.
+
+### Changed
+
+- **OAuth refresh + code-exchange failure logging sanitized.** `app/oauth/google.py` (1 call site), `app/oauth/wrike.py` (2 call sites) now log via `safe_error_summary` instead of raw `resp.text`. Eliminates the risk of a provider echoing request bodies (or, in rare misconfigurations, the refresh_token / client_secret) into Cloud Logging.
+- **User-facing error messages no longer interpolate the exception.** `app/slack_app/handlers.py` (agent-turn failure), `app/slack_app/commands/goodmorning.py` (briefing failure), `app/slack_app/commands/wrike_cmd.py` (date/time parse failure) now post a generic "try again" message to Slack. Full traceback still captured server-side via `logger.exception()` and the Phoenix span.
+- **`infrastructure/_env.sh` `PROJECT_ID` default reverted from `slack-marketing-bot` to `CHANGE-ME`.** A real GCP project ID shouldn't be baked into the public template. Users now set `PROJECT_ID` themselves before running the numbered scripts (same as initial deploy required).
+- **`.gitignore` expanded** to cover `.pytest_cache/`, `.mypy_cache/`, `.coverage`, `htmlcov/`, `Thumbs.db`, `.idea/`, `.vscode/`, `*.swp` / `*.swo` / `*.bak`, `*.pid`, `*.sock`, `.python-version` — common cache/editor/runtime artefacts that shouldn't ride along in the repo. Also gained `data/*.sqlite*` for completeness.
+
+### Removed
+
+- **`scripts/build_setup_guide.py`** — generates the local-dev setup guide `.docx`, irrelevant to the prod tree. Was a leftover from the dev → prod copy.
+
+### Security audit summary (what we checked and found clean)
+
+A full sweep covered: SQL injection (none — SQLModel ORM only), command injection (no `eval`/`exec`/`subprocess`/`shell=True`), insecure deserialization (no `pickle.loads`/`yaml.load_unsafe`), Slack signing verification (Bolt handles it), OAuth state CSRF (signed + 10-min TTL via itsdangerous), token encryption at rest (Fernet symmetric), container privileges (non-root uid 1001), Cloud SQL public IP (none, Auth Proxy only), service-account scopes (3 minimal roles), dependency pinning (`uv.lock`), hardcoded credentials (none in tracked files — verified by grep), open redirects (provider-fixed redirect URIs), CSRF on the FastAPI side (no state-changing POST endpoints public).
+
+Open items deferred (not exploitable in single-tenant): task_id shape validation before path interpolation in `WrikeClient.task()` (low — httpx URL-encodes); signed-payload + per-user-bound approval cards (recommended before going multi-tenant). Documented in `claude.md` "Planned work".
+
+### Why & tradeoffs
+
+- *Why an allow-list when Slack already signs the outer request?* Defense in depth. Bolt validates the HMAC over the request body, so an attacker can't forge a click. But the *button payload itself* (the JSON in `value`) is set by us at card-creation time and trusted blindly at click-time. A future regression that built a button with a non-write tool name would silently let users invoke that tool through the approval path. The allow-list closes that gap explicitly. Five lines of code.
+- *Tradeoff: every new write tool now requires a code change in two places* — `app/agent/tools.py` for the dispatcher, plus an entry in `WRITE_TOOL_ALLOWLIST`. Forgetting the allow-list entry means buttons silently get rejected with a clear log line — failure is loud, not silent. Acceptable.
+- *Why sanitize the OAuth error log instead of removing it entirely?* When refresh fails, we need to know *why* (expired token vs. revoked vs. provider outage vs. wrong client secret). The structured `status=400 error='invalid_grant' desc='Token expired'` is enough to triage without leaking request bodies.
+- *Why generic user messages?* Stack traces and DB error strings leak schema details and internal paths. The user is authenticated (it's their DM), but minimising info disclosure costs nothing and removes a low-effort recon vector. Operators still see everything via Cloud Logging + Phoenix.
+- *Why `CHANGE-ME` not `slack-marketing-bot` in `_env.sh`?* The project ID alone isn't a credential, but it's also not something a public GitHub repo should advertise. Anyone reading the repo learns a real GCP project name; combined with social engineering it's a small uplift for an attacker. Cost to switch: zero.
 
 ---
 
