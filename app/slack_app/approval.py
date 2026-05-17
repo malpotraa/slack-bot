@@ -46,52 +46,29 @@ WRITE_TOOL_ALLOWLIST: set[str] = {
 
 
 def build_approval_blocks(
-    intro_text: str,
     pending_actions: list[dict[str, Any]],
+    *,
+    intro_text: str | None = None,
+    primary_button_text: str = "✅ Confirm",
+    cancel_button_text: str = "❌ Cancel",
 ) -> list[dict[str, Any]]:
-    """Build Block Kit blocks for the approval card.
+    """Build Block Kit blocks for the approval card (no alternate / no conflict).
 
-    intro_text: short framing line (or the LLM's preamble, if you want).
+    intro_text: optional framing line; omit for a tighter card.
     pending_actions: list of {tool, args, summary} dicts from the runner.
     """
     blocks: list[dict[str, Any]] = []
     if intro_text:
         blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": intro_text},
-            }
+            {"type": "section", "text": {"type": "mrkdwn", "text": intro_text}}
         )
 
     for i, action in enumerate(pending_actions):
         summary = action.get("summary") or f"Call `{action['tool']}`"
-        # Bullet summary
         blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"• {summary}"},
-            }
+            {"type": "section", "text": {"type": "mrkdwn", "text": summary}}
         )
-        # Each action gets its own pair of buttons. We tag value with the
-        # action's tool name so multiple cards can co-exist if needed.
-        payload = json.dumps(
-            {
-                "tool": action["tool"],
-                "args": action.get("args") or {},
-                "summary": summary[:300],
-            }
-        )
-        # Slack value field limit is 2000 chars. Truncate gracefully if huge.
-        if len(payload) > 1900:
-            payload = json.dumps(
-                {
-                    "tool": action["tool"],
-                    "args": action.get("args") or {},
-                    "summary": "(summary truncated)",
-                    "_truncated": True,
-                }
-            )[:1990]
-
+        payload = _encode_payload(action["tool"], action.get("args") or {}, summary)
         blocks.append(
             {
                 "type": "actions",
@@ -99,14 +76,14 @@ def build_approval_blocks(
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "✅ Approve"},
+                        "text": {"type": "plain_text", "text": primary_button_text},
                         "style": "primary",
                         "action_id": APPROVE_ACTION_ID,
                         "value": payload,
                     },
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "❌ Disapprove"},
+                        "text": {"type": "plain_text", "text": cancel_button_text},
                         "style": "danger",
                         "action_id": DISAPPROVE_ACTION_ID,
                         "value": payload,
@@ -129,36 +106,34 @@ def _encode_payload(tool: str, args: dict[str, Any], summary: str) -> str:
 
 def build_approval_blocks_with_alternates(
     *,
-    intro_text: str,
     primary: dict[str, Any],
     alternate: dict[str, Any] | None = None,
-    primary_button_text: str = "✅ Approve",
+    intro_text: str | None = None,
+    primary_button_text: str = "✅ Confirm",
     alternate_button_text: str = "🔁 Use alternate",
+    cancel_button_text: str = "❌ Cancel",
 ) -> list[dict[str, Any]]:
     """Build an approval card with up to two paths plus Cancel.
 
     primary: {tool, args, summary}
-    alternate: optional second {tool, args, summary} (e.g. the suggested
-        free slot when the proposed slot overlaps)
+    alternate: optional second {tool, args, summary, short_time}
+        (e.g. the suggested free slot when the proposed slot overlaps)
+    intro_text: optional framing line. The conversational-agent card omits
+        this since the primary summary already carries the title + context.
+        The /wrike command supplies an "Overlap detected" intro.
     """
-    blocks: list[dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": intro_text}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"• {primary.get('summary') or primary['tool']}",
-            },
-        },
-    ]
-    if alternate:
+    blocks: list[dict[str, Any]] = []
+    if intro_text:
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": intro_text}}
+        )
+    body = primary.get("summary") or primary["tool"]
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
+    if alternate and alternate.get("summary"):
         blocks.append(
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"• _Or:_ {alternate.get('summary') or alternate['tool']}",
-                },
+                "text": {"type": "mrkdwn", "text": f"💡 {alternate['summary']}"},
             }
         )
 
@@ -168,7 +143,9 @@ def build_approval_blocks_with_alternates(
             "text": {"type": "plain_text", "text": primary_button_text},
             "style": "primary",
             "action_id": APPROVE_ACTION_ID,
-            "value": _encode_payload(primary["tool"], primary["args"], primary.get("summary") or ""),
+            "value": _encode_payload(
+                primary["tool"], primary["args"], primary.get("summary") or ""
+            ),
         }
     ]
     if alternate:
@@ -178,14 +155,16 @@ def build_approval_blocks_with_alternates(
                 "text": {"type": "plain_text", "text": alternate_button_text},
                 "action_id": APPROVE_ALT_ACTION_ID,
                 "value": _encode_payload(
-                    alternate["tool"], alternate["args"], alternate.get("summary") or ""
+                    alternate["tool"],
+                    alternate["args"],
+                    alternate.get("summary") or "",
                 ),
             }
         )
     elements.append(
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "❌ Disapprove"},
+            "text": {"type": "plain_text", "text": cancel_button_text},
             "style": "danger",
             "action_id": DISAPPROVE_ACTION_ID,
             "value": _encode_payload("(none)", {}, "cancelled"),

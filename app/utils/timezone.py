@@ -44,6 +44,12 @@ def fmt_local_dt(dt: datetime, tz_name: str | None) -> str:
     return local.strftime("%a %b %-d, %-I:%M%p").replace("AM", "am").replace("PM", "pm")
 
 
+def fmt_local_time(dt: datetime, tz_name: str | None) -> str:
+    """Render just the time component in the user's tz as '10:00am'."""
+    local = dt.astimezone(user_tz(tz_name))
+    return local.strftime("%-I:%M%p").replace("AM", "am").replace("PM", "pm")
+
+
 def fmt_local_range(start: datetime, end: datetime, tz_name: str | None) -> str:
     """Render a range in the user's tz as 'Mon May 18, 10:00am – 10:30am'.
 

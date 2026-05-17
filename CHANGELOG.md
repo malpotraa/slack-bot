@@ -8,7 +8,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.6.1`) is what's queued for deploy.
+Nothing pending right now. The previous release (`v1.6.2`) is what's queued for deploy.
+
+---
+
+## [1.6.2] — 2026-05-17
+
+Approval-card UX cleanup. Same data, ~50% less visual weight.
+
+### Changed
+
+- **Conversational-agent chat reply on writes is now one short sentence.** The system prompt (`app/agent/prompts.py` "APPROVAL FLOW" section) now explicitly forbids echoing times, conflicts, or alternate slots in the chat reply — the card carries that. Examples in the prompt show the good/bad shapes side by side.
+- **Approval card layout flattened** (`app/agent/tools.py` previews + `app/slack_app/approval.py` builders). For calendar create/update previews:
+  - Title line: `📅 Move *<title>*` / `📅 Create *<title>* — *<range>*` / `📅 Rename *<title>*` (verb picked from what changed).
+  - Times: `*<Current range>*  →  *<New range>*` on one line (was: two indented bullets with separate `Current:` and `New:` labels).
+  - Conflict: `⚠️ Overlaps *<event>* (10:00am–11:00am)` on one line (was: nested `• Conflicts with:` header + indented `    • event — full range` bullet, plus full date repeated despite already being in the new-range line above).
+  - Multiple conflicts: shows the first + `(+N more)` suffix instead of a 5-row list.
+  - Alternate suggestion: rendered once by the card builder as `💡 Suggested: *<range>*` (was: also embedded in the primary summary, so the card duplicated it).
+- **Button labels** are tool-specific and time-interpolated:
+  - Conflict primary: `✅ Move anyway` / `✅ Create anyway`.
+  - No-conflict primary: `✅ Move` / `✅ Create` / `✅ Schedule` / `✅ Post` / `✅ Update`.
+  - Alternate: `🔁 Use <time>` (e.g. `🔁 Use 11:30am`) when `short_time` is present; falls back to `🔁 Use suggested slot`.
+  - Cancel: `❌ Cancel` (was `❌ Disapprove`).
+- **`build_approval_blocks` signature**: `pending_actions` is now positional; `intro_text` is keyword-only and defaults to `None` (no intro line on simple cards — the summary text already includes the title).
+- **`build_approval_blocks_with_alternates`**: now renders an `alternate.summary` as its own section if present, instead of expecting the caller to fold it into the primary summary. `/wrike`'s existing call site keeps its `intro_text="Overlap detected…"` and unchanged primary/alternate shape.
+- **New helper** `app/utils/timezone.py:fmt_local_time(dt, tz_name)` — returns just `10:00am` for inline conflict / button-label use.
+
+### Why & tradeoffs
+
+- *Why move conflict details out of the chat reply?* The user was reading the same conflict + alternate text twice — once in chat ("Heads up: that overlaps with…") and once on the card. Putting one canonical copy on the card removes the duplication and makes the chat reply skimmable. The model was being chatty because the tool's `summary_for_user` was multi-line and verbose; the prompt now states "ONE short sentence" with a counter-example.
+- *Why interpolate the time into the alternate button?* `🔁 Use suggested slot` is generic; users have to look up at the card body to see what it means. `🔁 Use 11:30am` is the actual decision the user is making, on the button itself. Costs one extra field on the alternate dict (`short_time`).
+- *Why "Cancel" not "Disapprove"?* `Disapprove` reads like a verdict on the assistant; `Cancel` reads as "back out of this action". Same effect; friendlier framing.
+- *Why per-tool primary verbs ("Move", "Create", "Post")?* `Approve` is generic; the specific verb tells the user what's about to happen without re-reading the card body. Costs ~15 lines of `_approval_button_labels()` mapping. Easy to extend when new write tools land.
+- *Tradeoff: the card now has no "🔔 Approval needed" header* on the conversational-agent path. The card is obviously an approval prompt (title + buttons), and the header line was visual noise. The `/wrike` flow still uses `intro_text=` for its overlap framing because its UX leans on that line.
 
 ---
 

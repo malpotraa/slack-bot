@@ -96,6 +96,40 @@ def _strip_mentions(text: str) -> str:
     return _MENTION_RE.sub("", text or "").strip()
 
 
+def _approval_button_labels(action: dict) -> tuple[str, str]:
+    """Pick (primary, alternate) button labels per tool + conflict state.
+
+    The alternate label always interpolates the suggested slot's wall-clock
+    time when one is available, so users see "🔁 Use 11:30am" instead of a
+    generic "🔁 Use suggested slot".
+    """
+    tool = action["tool"]
+    alternate = action.get("alternate") or {}
+    short = alternate.get("short_time")
+    alt_label = f"🔁 Use {short}" if short else "🔁 Use suggested slot"
+
+    if alternate:
+        # Conflict path — the primary commits the user's original times anyway.
+        if tool == "create_calendar_event":
+            return "✅ Create anyway", alt_label
+        if tool == "update_calendar_event":
+            return "✅ Move anyway", alt_label
+        return "✅ Confirm", alt_label
+
+    # No conflict — short, neutral verbs.
+    if tool == "create_calendar_event":
+        return "✅ Create", alt_label
+    if tool == "update_calendar_event":
+        return "✅ Move", alt_label
+    if tool == "schedule_wrike_task":
+        return "✅ Schedule", alt_label
+    if tool == "post_wrike_task_comment":
+        return "✅ Post", alt_label
+    if tool in {"update_wrike_task_status", "update_working_hours"}:
+        return "✅ Update", alt_label
+    return "✅ Confirm", alt_label
+
+
 async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict) -> None:
     if event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
         return
@@ -251,28 +285,28 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             channel=channel_id, thread_ts=thread_ts, text=to_slack_mrkdwn(reply)
         )
 
-    # If the agent proposed any writes, post a separate Approve / Disapprove
-    # card per action in the same thread. When a conflict produced an
-    # alternate suggestion, render the 3-button alt card; otherwise the
-    # simple Approve/Disapprove card.
+    # If the agent proposed any writes, post an approval card per action.
+    # The card is flat: the tool's `summary_for_user` already contains the
+    # title line, current → new, and any conflict/alternate notes. We only
+    # pick button labels here based on tool + whether an alternate exists.
     for action in pending_actions:
+        primary_text, alt_text = _approval_button_labels(action)
         alternate = action.get("alternate")
         if alternate:
             blocks = build_approval_blocks_with_alternates(
-                intro_text="🔔  *Approval needed*",
                 primary={
                     "tool": action["tool"],
                     "args": action.get("args") or {},
                     "summary": action.get("summary") or "",
                 },
                 alternate=alternate,
-                primary_button_text="✅ Use this time (keep conflict)",
-                alternate_button_text="🔁 Use suggested slot",
+                primary_button_text=primary_text,
+                alternate_button_text=alt_text,
             )
         else:
             blocks = build_approval_blocks(
-                intro_text="🔔  *Approval needed* — please review and click below.",
-                pending_actions=[action],
+                [action],
+                primary_button_text=primary_text,
             )
         try:
             await client.chat_postMessage(

@@ -26,6 +26,7 @@ from app.integrations import wrike as wrike_int
 from app.utils.timezone import (
     end_of_day,
     fmt_local_range,
+    fmt_local_time,
     now_in,
     start_of_day,
     user_tz,
@@ -408,9 +409,8 @@ async def _conflict_alternate(
     return {
         "tool": tool_name,
         "args": alt_args,
-        "summary": (
-            f"Use suggested free slot: *{fmt_local_range(alt.start, alt.end, tz_name)}*"
-        ),
+        "summary": f"Suggested: *{fmt_local_range(alt.start, alt.end, tz_name)}*",
+        "short_time": fmt_local_time(alt.start, tz_name),
     }
 
 
@@ -430,26 +430,18 @@ async def _create_calendar_event(
 
     if not confirmed:
         when = fmt_local_range(start, end, tz_name)
-        lines = [f"Create *{title}* — {when}."]
+        lines = [f"📅 Create *{title}* — *{when}*"]
 
         # Conflict check
         overlaps = await gcal.find_overlaps(user_id, start, end)
         alternate: dict | None = None
         if overlaps:
+            ov = overlaps[0]
+            ov_when = _format_overlap_when(ov, tz_name)
+            ov_title = ov.get("title") or "(untitled)"
+            extra = f" (+{len(overlaps) - 1} more)" if len(overlaps) > 1 else ""
             lines.append("")
-            lines.append("⚠️ *Conflicts with:*")
-            for ov in overlaps[:5]:
-                try:
-                    s = _parse_dt(ov["start"], tz_name)
-                    e = _parse_dt(ov["end"], tz_name)
-                    when_ov = fmt_local_range(s, e, tz_name)
-                except Exception:
-                    when_ov = ""
-                title_ov = ov.get("title") or "(untitled)"
-                line = f"    • *{title_ov}*"
-                if when_ov:
-                    line += f" — {when_ov}"
-                lines.append(line)
+            lines.append(f"⚠️ Overlaps *{ov_title}* ({ov_when}){extra}")
 
             alternate = await _conflict_alternate(
                 user_id=user_id,
@@ -472,9 +464,8 @@ async def _create_calendar_event(
             "preview": True,
             "summary_for_user": "\n".join(lines),
             "next_action": (
-                "If the user approves, call create_calendar_event again with the same "
-                "arguments and confirmed=true. If conflicts were reported and the user "
-                "wants to keep the proposed time anyway, just approve."
+                "Reply with ONE short sentence stating intent — do NOT echo "
+                "the times, conflicts, or alternate. The approval card shows all of that."
             ),
         }
         if alternate is not None:
@@ -530,31 +521,40 @@ async def _update_calendar_event(
         }
 
     if not confirmed:
-        lines: list[str] = [f"Update event *{cur_title}*:"]
-
-        if new_title and new_title != cur_title:
-            lines.append(f"  • Title — *Current:* {cur_title}")
-            lines.append(f"  • Title — *New:*     {new_title}")
-        if new_description is not None:
-            lines.append("  • Description will be updated.")
-
         time_changed = bool(new_start or new_end)
+        title_changed = bool(new_title and new_title != cur_title)
+
+        # Pick a verb for the header line — "Move" reads better than "Update"
+        # when only the time changes; "Rename" when only title; otherwise "Update".
+        if time_changed and not title_changed and new_description is None:
+            verb = "Move"
+        elif title_changed and not time_changed and new_description is None:
+            verb = "Rename"
+        else:
+            verb = "Update"
+
+        lines: list[str] = [f"📅 {verb} *{cur_title}*"]
+
         if time_changed:
             try:
                 cur_s = _parse_dt(cur_start_iso, tz_name)
                 cur_e = _parse_dt(cur_end_iso, tz_name)
-                lines.append(f"  • *Current:* {fmt_local_range(cur_s, cur_e, tz_name)}")
+                cur_str = fmt_local_range(cur_s, cur_e, tz_name)
             except Exception:
-                lines.append(f"  • *Current:* {cur_start_iso} – {cur_end_iso}")
+                cur_str = f"{cur_start_iso} – {cur_end_iso}"
             try:
                 effective_start = new_start or _parse_dt(cur_start_iso, tz_name)
                 effective_end = new_end or _parse_dt(cur_end_iso, tz_name)
-                lines.append(
-                    f"  • *New:*     "
-                    f"{fmt_local_range(effective_start, effective_end, tz_name)}"
-                )
+                new_str = fmt_local_range(effective_start, effective_end, tz_name)
             except Exception:
-                pass
+                effective_start = effective_end = None
+                new_str = ""
+            lines.append(f"*{cur_str}*  →  *{new_str}*" if new_str else f"*{cur_str}*")
+
+        if title_changed:
+            lines.append(f"Title → *{new_title}*")
+        if new_description is not None:
+            lines.append("Description will be updated.")
 
         # Conflict check — only when time actually changes.
         alternate: dict | None = None
@@ -573,20 +573,12 @@ async def _update_calendar_event(
                     exclude_event_id=event_id,
                 )
                 if overlaps:
+                    ov = overlaps[0]
+                    ov_when = _format_overlap_when(ov, tz_name)
+                    ov_title = ov.get("title") or "(untitled)"
+                    extra = f" (+{len(overlaps) - 1} more)" if len(overlaps) > 1 else ""
                     lines.append("")
-                    lines.append("⚠️ *Conflicts with:*")
-                    for ov in overlaps[:5]:
-                        try:
-                            s = _parse_dt(ov["start"], tz_name)
-                            e = _parse_dt(ov["end"], tz_name)
-                            when_ov = fmt_local_range(s, e, tz_name)
-                        except Exception:
-                            when_ov = ""
-                        title_ov = ov.get("title") or "(untitled)"
-                        line = f"    • *{title_ov}*"
-                        if when_ov:
-                            line += f" — {when_ov}"
-                        lines.append(line)
+                    lines.append(f"⚠️ Overlaps *{ov_title}* ({ov_when}){extra}")
 
                     base_args = {
                         "event_id": event_id,
@@ -595,7 +587,6 @@ async def _update_calendar_event(
                         "start_iso": (new_start or effective_start).isoformat(),
                         "end_iso": (new_end or effective_end).isoformat(),
                     }
-                    # Drop None values so the JSON payload stays small.
                     base_args = {k: v for k, v in base_args.items() if v is not None}
                     alternate = await _conflict_alternate(
                         user_id=user_id,
@@ -608,14 +599,15 @@ async def _update_calendar_event(
                         base_args=base_args,
                         tool_name="update_calendar_event",
                     )
+                    if alternate is not None:
+                        lines.append(f"💡 {alternate['summary']}")
 
         result: dict = {
             "preview": True,
             "summary_for_user": "\n".join(lines),
             "next_action": (
-                "If the user approves, call update_calendar_event again with the same "
-                "event_id and confirmed=true. If conflicts were reported and the user "
-                "wants to keep the proposed time anyway, just approve."
+                "Reply with ONE short sentence stating intent — do NOT echo "
+                "the times, conflicts, or alternate. The approval card shows all of that."
             ),
         }
         if alternate is not None:
@@ -1002,3 +994,14 @@ def _parse_dt(s: str, tz_name: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=user_tz(tz_name))
     return dt
+
+
+def _format_overlap_when(ov: dict, tz_name: str) -> str:
+    """Format an overlap event's time range for inline display in a preview."""
+    try:
+        s = _parse_dt(ov["start"], tz_name)
+        e = _parse_dt(ov["end"], tz_name)
+    except Exception:
+        return ""
+    # Drop the date prefix — the surrounding line already establishes "this day".
+    return f"{fmt_local_time(s, tz_name)}–{fmt_local_time(e, tz_name)}"
