@@ -8,7 +8,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.7.1`) is what's queued for deploy.
+Nothing pending right now. The previous release (`v1.7.2`) is what's queued for deploy.
+
+---
+
+## [1.7.2] — 2026-05-17
+
+Single-line hot-fix for a duplicate "💡 Suggested" line on the conflict approval card for `update_calendar_event`.
+
+### Fixed
+
+- **Duplicate suggested-slot line on the update preview** in `app/agent/tools.py:_update_calendar_event`. The function was still appending `💡 {alternate['summary']}` into `summary_for_user` after the v1.6.2 redesign moved that rendering responsibility to the card builder (`build_approval_blocks_with_alternates`). The create-path equivalent was correctly stripped at the time, but the update-path's deeper indentation meant the same `replace_all=true` edit didn't match it. Result on the card:
+  ```
+  💡 Suggested: Tue May 19, 11:30am – 12:00pm
+  💡 Suggested: Tue May 19, 11:30am – 12:00pm
+  ```
+  Now rendered once by the card builder only.
+
+### Why & tradeoffs
+
+- *Why did the original removal miss this?* Both create and update had a `lines.append(f"💡 {alternate['summary']}")` line, but at different indentation levels (create's was inside `if overlaps:`; update's was nested inside `if time_changed: if effective_start and effective_end: if overlaps:`). A `replace_all=true` with the shallower-indented text matched only the create occurrence — `replace_all` is *all occurrences of the exact string*, not *all semantically-equivalent lines*. Lesson for future refactors of indented bodies: prefer two distinct `Edit` calls or a regex tool over `replace_all` when whitespace differs.
+- *Why not just rely on prompt caching for the redundancy?* The duplication was in the user-visible card body, not in the LLM input — caching wouldn't have helped, and the user noticed within one trace.
 
 ---
 

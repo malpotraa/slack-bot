@@ -643,8 +643,6 @@ async def _update_calendar_event(
                         base_args=base_args,
                         tool_name="update_calendar_event",
                     )
-                    if alternate is not None:
-                        lines.append(f"💡 {alternate['summary']}")
 
         result: dict = {
             "preview": True,
