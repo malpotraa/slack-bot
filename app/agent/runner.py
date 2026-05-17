@@ -5,7 +5,9 @@ Latency optimizations baked in:
   • Prompt caching — system prompt + tool definitions are marked
     `cache_control: ephemeral` so subsequent turns hit Anthropic's cache
     instead of re-tokenizing 1000+ tokens of prompt.
-  • Tight iteration cap — default 3 (was 8). Forces decisive tool use.
+  • Tight iteration cap — default 4 (was 8 → 3 → 4). Bumped from 3 after
+    multi-step write flows (list → update_preview → speak) ran out of headroom
+    when the model defensively re-listed before the update.
 
 Phoenix tracing remains rich: per-turn span, per-tool span, full input/output.
 """
@@ -119,7 +121,7 @@ async def run_agent_turn(
     slack_bot_token: str | None = None,
     channel_id: str = "",
     thread_ts: str = "",
-    max_tool_iterations: int = 3,
+    max_tool_iterations: int = 4,
     on_stream_chunk: StreamCallback | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run one user turn through Claude with streaming + prompt caching.

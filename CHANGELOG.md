@@ -8,7 +8,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.6.0`) is what's queued for deploy.
+Nothing pending right now. The previous release (`v1.6.1`) is what's queued for deploy.
+
+---
+
+## [1.6.1] — 2026-05-17
+
+Hot-fix after the v1.6.0 deploy: the conversational agent was hitting the tool-iteration cap on multi-step write flows.
+
+### Changed
+
+- **Default `max_tool_iterations` raised from 3 → 4** in `app/agent/runner.py`. The 3-turn cap was too tight for the common pattern `list_calendar_events → update_calendar_event(confirmed=false) → speak`, especially when the model defensively re-checked before writing. Symptom: user saw `I hit my tool-use limit before finishing — try asking again more specifically.` instead of an approval card, because the preview tool never got invoked and `pending_actions` was empty.
+- **System prompt** in `app/agent/prompts.py` now tells the model that `create_calendar_event` and `update_calendar_event` already run their own conflict check + refetch the current event, so it should go straight to the write tool after a single `list_calendar_events`. Updated the "BE DECISIVE" section's iteration count to match (3 → 4).
+
+### Why & tradeoffs
+
+- *Why bump the cap by only 1?* 3 turns is the asymptotic minimum for a write flow without persisted tool results (`list → preview → speak`), so any defensiveness blows through. 4 buys exactly one extra step for re-fetch or follow-up; 5+ starts to allow runaway loops. The prompt change attacks the same problem from the other direction — fewer wasted turns to begin with — so 4 should be ample headroom.
+- *Cost impact?* One extra Anthropic call worst-case, ~$0.005 per affected turn at current Sonnet 4.6 pricing. Cached prompt makes the input side nearly free. Worth it to avoid the dead-end "limit reached" UX.
+- *Why call out the conflict check in the prompt?* Without it, the model has no way to know `update_calendar_event` got smarter. We surface tool behaviour at the prompt level so the model's planning matches what the tools actually do — keeps the iteration budget aligned with the contract.
 
 ---
 

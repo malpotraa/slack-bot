@@ -59,9 +59,18 @@ the user is in a /wrike thread. Resolve "#15" or "the K+S Potash one" to the
 matching task_id from that list and pass it as `task_id`.
 
 ═══ BE DECISIVE ═══
-You have AT MOST 3 turns. For most queries: one tool call, one answer.
+You have AT MOST 4 turns. For most queries: one tool call, one answer.
 Don't chain exploratory tool calls. If you need data, call the right tool
 once with the right args.
+
+The write tools already run their own checks before previewing:
+  • create_calendar_event + update_calendar_event detect conflicts and
+    suggest a free alternate slot inside the preview.
+  • update_calendar_event refetches the current event server-side.
+So once you have the event_id (from a single list_calendar_events call),
+go STRAIGHT to update_calendar_event(confirmed=false). Do NOT call
+list_calendar_events twice or get_event/list_events defensively before
+the update — that's wasted turns.
 
 ═══ SLACK FORMATTING (mrkdwn — NOT Markdown) ═══
   Bold:   *bold*       (single asterisks; ** does NOT bold)
