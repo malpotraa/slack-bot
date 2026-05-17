@@ -25,7 +25,10 @@ from app.config import settings
 from app.db.engine import session_scope
 from app.db.users import get_or_create_user
 from app.sessions import store as session_store
-from app.slack_app.approval import build_approval_blocks
+from app.slack_app.approval import (
+    build_approval_blocks,
+    build_approval_blocks_with_alternates,
+)
 from app.slack_app.commands.wrike_cmd import try_handle_wrike_thread_reply
 from app.utils.slack_mrkdwn import to_slack_mrkdwn
 
@@ -249,12 +252,28 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         )
 
     # If the agent proposed any writes, post a separate Approve / Disapprove
-    # card in the same thread. Clicking a button runs the action.
-    if pending_actions:
-        blocks = build_approval_blocks(
-            intro_text="🔔  *Approval needed* — please review and click below.",
-            pending_actions=pending_actions,
-        )
+    # card per action in the same thread. When a conflict produced an
+    # alternate suggestion, render the 3-button alt card; otherwise the
+    # simple Approve/Disapprove card.
+    for action in pending_actions:
+        alternate = action.get("alternate")
+        if alternate:
+            blocks = build_approval_blocks_with_alternates(
+                intro_text="🔔  *Approval needed*",
+                primary={
+                    "tool": action["tool"],
+                    "args": action.get("args") or {},
+                    "summary": action.get("summary") or "",
+                },
+                alternate=alternate,
+                primary_button_text="✅ Use this time (keep conflict)",
+                alternate_button_text="🔁 Use suggested slot",
+            )
+        else:
+            blocks = build_approval_blocks(
+                intro_text="🔔  *Approval needed* — please review and click below.",
+                pending_actions=[action],
+            )
         try:
             await client.chat_postMessage(
                 channel=channel_id,

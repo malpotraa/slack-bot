@@ -242,6 +242,58 @@ def event_to_busy_slot(event: dict) -> TimeSlot | None:
     return TimeSlot(start=s, end=e)
 
 
+async def find_overlaps(
+    user_id: int,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_event_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return a compact summary of events that overlap [start, end].
+
+    Skips: declined events, transparent (Free) events, all-day events, and the
+    event whose id matches `exclude_event_id` (used when updating an event so
+    we don't conflict-detect against itself).
+    """
+    from datetime import timedelta as _td
+
+    events = await list_events(
+        user_id, time_min=start - _td(hours=4), time_max=end + _td(hours=4)
+    )
+    overlaps: list[dict[str, Any]] = []
+    for ev in events:
+        if exclude_event_id and ev.get("id") == exclude_event_id:
+            continue
+        if event_response_status(ev, None) == "declined":
+            continue
+        slot = event_to_busy_slot(ev)
+        if slot is None:
+            continue
+        if slot.start < end and start < slot.end:
+            overlaps.append(
+                {
+                    "id": ev.get("id"),
+                    "title": ev.get("summary"),
+                    "start": ev["start"]["dateTime"],
+                    "end": ev["end"]["dateTime"],
+                }
+            )
+    return overlaps
+
+
+async def busy_slots_in_horizon(
+    user_id: int, anchor: datetime, *, days: int = 5
+) -> list[TimeSlot]:
+    """Pull busy TimeSlots for [anchor-4h, anchor + days]. Used by the
+    free-slot finder when suggesting an alternative time."""
+    from datetime import timedelta as _td
+
+    events = await list_events(
+        user_id, time_min=anchor - _td(hours=4), time_max=anchor + _td(days=days)
+    )
+    return [s for s in (event_to_busy_slot(ev) for ev in events) if s]
+
+
 def classify_event(event: dict) -> str:
     """Rough categorization for the /goodmorning summary."""
     summary = (event.get("summary") or "").lower()

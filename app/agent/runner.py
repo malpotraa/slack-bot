@@ -303,6 +303,7 @@ async def run_agent_turn(
                                 "args": tool_input,
                                 "summary": result.get("summary_for_user", ""),
                                 "resolved_task_id": result.get("_resolved_task_id"),
+                                "alternate": result.get("alternate"),
                             }
                         )
 

@@ -8,7 +8,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.5.0`) is what's queued for deploy.
+Nothing pending right now. The previous release (`v1.6.0`) is what's queued for deploy.
+
+---
+
+## [1.6.0] — 2026-05-16
+
+Approval-card UX: human-readable times and conflict detection on calendar create/update.
+
+### Added
+
+- **Time-formatting helpers** in `app/utils/timezone.py`: `fmt_local_dt(dt, tz_name)` and `fmt_local_range(start, end, tz_name)`. Both convert to the user's tz first, then render `Mon May 18, 10:00am – 10:30am` (same day) or `Mon May 18, 11:30pm – Tue May 19, 12:30am` (cross-day). Replaces raw ISO strings (`2026-05-18T10:00:00-06:00`) in every approval preview.
+- **Public overlap helpers** in `app/integrations/google_calendar.py`: `find_overlaps(user_id, start, end, *, exclude_event_id=None)` and `busy_slots_in_horizon(user_id, anchor, *, days=5)`. Skips declined / transparent (Free) / all-day events and the event being updated itself. Extracted from `/wrike`'s scheduler so the conversational agent's create/update tools can reuse the same logic.
+- **Conflict detection on `create_calendar_event` and `update_calendar_event` previews.** When the proposed time overlaps existing events, the preview lists each conflicting event (title + time, capped at 5) and includes an `alternate` field with the next free slot of the same duration on/after the proposed start (search horizon: 5 days, computed inside the user's working window via `first_free_slot_for_duration`).
+- **Alternate-aware approval card** rendered by `app/slack_app/handlers.py`. Each pending action becomes its own card. When the tool returned an `alternate`, the card has three buttons: `✅ Use this time (keep conflict)` (re-dispatches with the user's original times, conflict ignored — that was an explicit ask), `🔁 Use suggested slot` (re-dispatches with the alternate's start/end), and `❌ Disapprove`. When there's no conflict, the existing two-button card is used.
+
+### Changed
+
+- **`update_calendar_event` preview layout** now puts `*Current:*` and `*New:*` on separate lines instead of `Current → New` on one line. Title and time render on independent lines so long event names don't break the layout.
+- **`dispatch_tool` signature use** — `create_calendar_event` and `update_calendar_event` now receive `workday_start` / `workday_end` from the dispatcher (they were already plumbed in for other tools). Required for the alternate-slot search to stay inside the user's working hours.
+- **`run_agent_turn` `pending_actions` items** gained an optional `alternate` field, captured from the tool's preview result and passed through to the handler.
+
+### Why & tradeoffs
+
+- *Why human-readable times?* The previous preview showed `start: 2026-05-18T10:00:00-06:00 → 2026-05-19T10:00:00-06:00`. That's three things at once (date, time, offset) in a format no one reads quickly, and the offset doubles as a fake confirmation that the tz is right — even though we already converted to the user's tz internally. Users were eyeballing the offset to verify, which is exactly the wrong load-bearing decision. `Mon May 18, 10:00am – 10:30am` is unambiguous in the user's frame because the bot already knows their tz.
+- *Why detect conflicts at preview time, not just hope the user noticed?* The old flow trusted the LLM to call `list_calendar_events` first. It often didn't, especially for one-shot "move it to Tuesday" requests where the model has the event_id and just patches. Two real cases hit this: an existing meeting was double-booked because the model didn't re-check, and a focus block was placed inside an existing 1:1. Adding the check at the tool level makes it impossible to skip and means the approval card itself is the conflict review surface.
+- *Why allow "Use this time (keep conflict)" instead of forcing the alternate?* The user explicitly asked for this — sometimes you *want* to overlap (e.g. you'll only attend the first half of one meeting). Refusing or forcing a re-pick would be paternalistic. The three-button card surfaces both options so the choice is explicit and recorded (Slack message log).
+- *Why search 5 days and not, say, 30?* P50 of `list_events` over a 5-day window with the gen2 Cloud Run sizing is ~300–500ms; a 30-day window with paging is multi-second and we're already inside the user's first turn. Five days covers "today" / "tomorrow" / "this week" intents, which is what the conversational write path is for. The Wrike scheduler still has its own horizon (`/wrike` is built for multi-day scheduling).
+- *Tradeoff: cards now post one-per-action instead of one-bundled.* If the LLM proposes two writes in one turn (rare in practice — most turns are single-action), the user sees two cards. Acceptable: each is independently approvable, and the alternate path only makes sense per-action anyway.
+- *Tradeoff: the alternate's `args` payload now embeds an extra `start_iso`/`end_iso` pair.* Approval-button `value` size is bounded at 2000 chars; current payloads are ~250 chars even with the alternate, well under the limit. If a future tool grows args dramatically, `_encode_payload` already truncates gracefully.
 
 ---
 

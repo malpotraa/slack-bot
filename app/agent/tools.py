@@ -23,7 +23,14 @@ from dateutil import parser as dateparser
 from app.integrations import google_calendar as gcal
 from app.integrations import slack_search
 from app.integrations import wrike as wrike_int
-from app.utils.timezone import end_of_day, now_in, start_of_day, user_tz
+from app.utils.timezone import (
+    end_of_day,
+    fmt_local_range,
+    now_in,
+    start_of_day,
+    user_tz,
+)
+from app.utils.working_hours import first_free_slot_for_duration
 
 
 # ── Tool schemas exposed to Claude ─────────────────────────────────────────
@@ -281,9 +288,21 @@ async def dispatch_tool(
     if name == "list_calendar_events":
         return await _list_calendar_events(inputs, user_id=user_id, tz_name=user_tz)
     if name == "create_calendar_event":
-        return await _create_calendar_event(inputs, user_id=user_id, tz_name=user_tz)
+        return await _create_calendar_event(
+            inputs,
+            user_id=user_id,
+            tz_name=user_tz,
+            workday_start=workday_start,
+            workday_end=workday_end,
+        )
     if name == "update_calendar_event":
-        return await _update_calendar_event(inputs, user_id=user_id, tz_name=user_tz)
+        return await _update_calendar_event(
+            inputs,
+            user_id=user_id,
+            tz_name=user_tz,
+            workday_start=workday_start,
+            workday_end=workday_end,
+        )
     if name == "list_wrike_tasks":
         return await _list_wrike_tasks(inputs, user_id=user_id)
     if name == "get_wrike_task":
@@ -353,7 +372,56 @@ async def _list_calendar_events(inputs: dict, *, user_id: int, tz_name: str) -> 
     }
 
 
-async def _create_calendar_event(inputs: dict, *, user_id: int, tz_name: str) -> dict:
+async def _conflict_alternate(
+    *,
+    user_id: int,
+    tz_name: str,
+    workday_start: str,
+    workday_end: str,
+    start: datetime,
+    end: datetime,
+    title: str,
+    base_args: dict,
+    tool_name: str,
+) -> dict | None:
+    """If [start, end] overlaps existing events, return a pending-action dict
+    that proposes the next free slot of the same duration on/after the
+    requested start. Returns None if no alternative could be found.
+    """
+    duration_min = max(int((end - start).total_seconds() // 60), 15)
+    busy = await gcal.busy_slots_in_horizon(user_id, start, days=5)
+    alt = first_free_slot_for_duration(
+        busy,
+        duration_minutes=duration_min,
+        horizon_days=5,
+        workday_start=workday_start,
+        workday_end=workday_end,
+        tz_name=tz_name,
+        not_before=start,
+    )
+    if alt is None:
+        return None
+    alt_args = dict(base_args)
+    alt_args["start_iso"] = alt.start.isoformat()
+    alt_args["end_iso"] = alt.end.isoformat()
+    alt_args["confirmed"] = True
+    return {
+        "tool": tool_name,
+        "args": alt_args,
+        "summary": (
+            f"Use suggested free slot: *{fmt_local_range(alt.start, alt.end, tz_name)}*"
+        ),
+    }
+
+
+async def _create_calendar_event(
+    inputs: dict,
+    *,
+    user_id: int,
+    tz_name: str,
+    workday_start: str,
+    workday_end: str,
+) -> dict:
     title = inputs.get("title", "").strip()
     start = _parse_dt(inputs["start_iso"], tz_name)
     end = _parse_dt(inputs["end_iso"], tz_name)
@@ -361,18 +429,57 @@ async def _create_calendar_event(inputs: dict, *, user_id: int, tz_name: str) ->
     confirmed = bool(inputs.get("confirmed"))
 
     if not confirmed:
-        return {
+        when = fmt_local_range(start, end, tz_name)
+        lines = [f"Create *{title}* — {when}."]
+
+        # Conflict check
+        overlaps = await gcal.find_overlaps(user_id, start, end)
+        alternate: dict | None = None
+        if overlaps:
+            lines.append("")
+            lines.append("⚠️ *Conflicts with:*")
+            for ov in overlaps[:5]:
+                try:
+                    s = _parse_dt(ov["start"], tz_name)
+                    e = _parse_dt(ov["end"], tz_name)
+                    when_ov = fmt_local_range(s, e, tz_name)
+                except Exception:
+                    when_ov = ""
+                title_ov = ov.get("title") or "(untitled)"
+                line = f"    • *{title_ov}*"
+                if when_ov:
+                    line += f" — {when_ov}"
+                lines.append(line)
+
+            alternate = await _conflict_alternate(
+                user_id=user_id,
+                tz_name=tz_name,
+                workday_start=workday_start,
+                workday_end=workday_end,
+                start=start,
+                end=end,
+                title=title,
+                base_args={
+                    "title": title,
+                    "description": description,
+                    "start_iso": inputs["start_iso"],
+                    "end_iso": inputs["end_iso"],
+                },
+                tool_name="create_calendar_event",
+            )
+
+        result: dict = {
             "preview": True,
-            "summary_for_user": (
-                f"Create a calendar event titled “{title}” from "
-                f"{start.strftime('%a %b %-d, %-I:%M%p')} to "
-                f"{end.strftime('%-I:%M%p')} ({tz_name})."
-            ),
+            "summary_for_user": "\n".join(lines),
             "next_action": (
                 "If the user approves, call create_calendar_event again with the same "
-                "arguments and confirmed=true."
+                "arguments and confirmed=true. If conflicts were reported and the user "
+                "wants to keep the proposed time anyway, just approve."
             ),
         }
+        if alternate is not None:
+            result["alternate"] = alternate
+        return result
 
     event = await gcal.create_event(
         user_id,
@@ -390,7 +497,14 @@ async def _create_calendar_event(inputs: dict, *, user_id: int, tz_name: str) ->
     }
 
 
-async def _update_calendar_event(inputs: dict, *, user_id: int, tz_name: str) -> dict:
+async def _update_calendar_event(
+    inputs: dict,
+    *,
+    user_id: int,
+    tz_name: str,
+    workday_start: str,
+    workday_end: str,
+) -> dict:
     event_id = inputs["event_id"]
     confirmed = bool(inputs.get("confirmed"))
 
@@ -401,8 +515,8 @@ async def _update_calendar_event(inputs: dict, *, user_id: int, tz_name: str) ->
         return {"error": f"Could not fetch event {event_id}: {exc}"}
 
     cur_title = ev.get("summary") or "(untitled)"
-    cur_start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
-    cur_end = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date")
+    cur_start_iso = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+    cur_end_iso = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date")
 
     new_title = inputs.get("title")
     new_description = inputs.get("description")
@@ -416,25 +530,97 @@ async def _update_calendar_event(inputs: dict, *, user_id: int, tz_name: str) ->
         }
 
     if not confirmed:
-        changes = []
+        lines: list[str] = [f"Update event *{cur_title}*:"]
+
         if new_title and new_title != cur_title:
-            changes.append(f"title: “{cur_title}” → “{new_title}”")
+            lines.append(f"  • Title — *Current:* {cur_title}")
+            lines.append(f"  • Title — *New:*     {new_title}")
         if new_description is not None:
-            changes.append("update description")
-        if new_start:
-            changes.append(f"start: {cur_start} → {new_start.isoformat()}")
-        if new_end:
-            changes.append(f"end: {cur_end} → {new_end.isoformat()}")
-        return {
+            lines.append("  • Description will be updated.")
+
+        time_changed = bool(new_start or new_end)
+        if time_changed:
+            try:
+                cur_s = _parse_dt(cur_start_iso, tz_name)
+                cur_e = _parse_dt(cur_end_iso, tz_name)
+                lines.append(f"  • *Current:* {fmt_local_range(cur_s, cur_e, tz_name)}")
+            except Exception:
+                lines.append(f"  • *Current:* {cur_start_iso} – {cur_end_iso}")
+            try:
+                effective_start = new_start or _parse_dt(cur_start_iso, tz_name)
+                effective_end = new_end or _parse_dt(cur_end_iso, tz_name)
+                lines.append(
+                    f"  • *New:*     "
+                    f"{fmt_local_range(effective_start, effective_end, tz_name)}"
+                )
+            except Exception:
+                pass
+
+        # Conflict check — only when time actually changes.
+        alternate: dict | None = None
+        if time_changed:
+            try:
+                effective_start = new_start or _parse_dt(cur_start_iso, tz_name)
+                effective_end = new_end or _parse_dt(cur_end_iso, tz_name)
+            except Exception:
+                effective_start = effective_end = None
+
+            if effective_start and effective_end:
+                overlaps = await gcal.find_overlaps(
+                    user_id,
+                    effective_start,
+                    effective_end,
+                    exclude_event_id=event_id,
+                )
+                if overlaps:
+                    lines.append("")
+                    lines.append("⚠️ *Conflicts with:*")
+                    for ov in overlaps[:5]:
+                        try:
+                            s = _parse_dt(ov["start"], tz_name)
+                            e = _parse_dt(ov["end"], tz_name)
+                            when_ov = fmt_local_range(s, e, tz_name)
+                        except Exception:
+                            when_ov = ""
+                        title_ov = ov.get("title") or "(untitled)"
+                        line = f"    • *{title_ov}*"
+                        if when_ov:
+                            line += f" — {when_ov}"
+                        lines.append(line)
+
+                    base_args = {
+                        "event_id": event_id,
+                        "title": new_title,
+                        "description": new_description,
+                        "start_iso": (new_start or effective_start).isoformat(),
+                        "end_iso": (new_end or effective_end).isoformat(),
+                    }
+                    # Drop None values so the JSON payload stays small.
+                    base_args = {k: v for k, v in base_args.items() if v is not None}
+                    alternate = await _conflict_alternate(
+                        user_id=user_id,
+                        tz_name=tz_name,
+                        workday_start=workday_start,
+                        workday_end=workday_end,
+                        start=effective_start,
+                        end=effective_end,
+                        title=cur_title,
+                        base_args=base_args,
+                        tool_name="update_calendar_event",
+                    )
+
+        result: dict = {
             "preview": True,
-            "summary_for_user": (
-                f"Update the event “{cur_title}”:\n  • " + "\n  • ".join(changes)
-            ),
+            "summary_for_user": "\n".join(lines),
             "next_action": (
                 "If the user approves, call update_calendar_event again with the same "
-                "event_id and confirmed=true."
+                "event_id and confirmed=true. If conflicts were reported and the user "
+                "wants to keep the proposed time anyway, just approve."
             ),
         }
+        if alternate is not None:
+            result["alternate"] = alternate
+        return result
 
     updated = await gcal.update_event(
         user_id,
