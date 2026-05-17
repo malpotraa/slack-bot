@@ -148,6 +148,53 @@ async def append_agent_turn(
         session.add(row)
 
 
+async def append_settled_action(
+    *,
+    user_id: int,
+    channel_id: str,
+    thread_ts: str,
+    outcome: str,
+    summary: str,
+) -> None:
+    """Record an approval-card outcome into the conversation history so the
+    NEXT agent turn sees it (e.g. user says "do that for next week too" right
+    after clicking Approve).
+
+    outcome: "approved" / "approved_alternate" / "cancelled"
+    summary: short human-readable description of what settled (the same text
+        used in the card body).
+    """
+    async with session_scope() as session:
+        row = await _find(
+            session, user_id=user_id, channel_id=channel_id, thread_ts=thread_ts
+        )
+        history: list[dict] = []
+        if row is not None and row.agent_history_json:
+            history = json.loads(row.agent_history_json)
+        # Inject a synthetic user+assistant exchange so the model sees it on
+        # the next turn through the normal history channel. Kept short to
+        # avoid bloating the cache miss.
+        history.append(
+            {
+                "role": "user",
+                "content": f"[system note: approval card settled — {outcome}]",
+            }
+        )
+        history.append({"role": "assistant", "content": f"Logged: {summary}"})
+
+        if row is None:
+            row = ConversationSession(
+                user_id=user_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                agent_history_json=json.dumps(history),
+            )
+        else:
+            row.agent_history_json = json.dumps(history)
+            row.updated_at = datetime.now(UTC)
+        session.add(row)
+
+
 async def _summarize_history(history: list[dict[str, Any]]) -> str | None:
     """Compress old turns into a short summary via Haiku. Returns None on failure."""
     # Lazy imports to avoid pulling Anthropic on every session-store call.

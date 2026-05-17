@@ -20,13 +20,16 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 from loguru import logger
+from openinference.semconv.trace import OpenInferenceSpanKindValues as Kind
+from openinference.semconv.trace import SpanAttributes
 from opentelemetry import trace
 
-from app.agent.prompts import ASSISTANT_SYSTEM_PROMPT
+from app.agent.prompts import ASSISTANT_SYSTEM_PROMPT, PROMPT_VERSION
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool
 from app.config import settings
-from app.observability import get_tracer
-from app.utils.timezone import now_in
+from app.integrations import google_calendar as gcal
+from app.observability import start_span
+from app.utils.timezone import fmt_local_range, now_in
 
 _anthropic: AsyncAnthropic | None = None
 
@@ -79,6 +82,45 @@ def _set_session_attrs(
 StreamCallback = Callable[[str], Awaitable[None]]
 
 
+async def _prefetch_upcoming_events_context(
+    user_id: int, tz_name: str, *, max_events: int = 8
+) -> str | None:
+    """Best-effort: fetch the next ~8 hours of events and return a compact
+    context string the LLM can use to answer "what's next?" without a tool
+    call. Returns None on any failure so the turn proceeds normally.
+    """
+    from datetime import timedelta
+
+    try:
+        now = now_in(tz_name)
+        events = await gcal.list_events(
+            user_id, time_min=now, time_max=now + timedelta(hours=8)
+        )
+    except Exception:
+        return None
+
+    lines: list[str] = []
+    for ev in events:
+        if gcal.event_is_all_day(ev):
+            continue
+        slot = gcal.event_to_busy_slot(ev)
+        if slot is None:
+            continue
+        title = ev.get("summary") or "(untitled)"
+        when = fmt_local_range(slot.start, slot.end, tz_name)
+        lines.append(f"  • {when} — {title}")
+        if len(lines) >= max_events:
+            break
+
+    if not lines:
+        return None
+    return (
+        "[Upcoming events (next 8h, may be stale by a few minutes):\n"
+        + "\n".join(lines)
+        + "\nUse list_calendar_events for longer ranges or precise lookups.]"
+    )
+
+
 def _clean_assistant_block(bd: dict[str, Any]) -> dict[str, Any]:
     """Strip SDK-side extra fields before round-tripping into the next request.
 
@@ -113,6 +155,7 @@ async def run_agent_turn(
     user_tz: str,
     workday_start: str,
     workday_end: str,
+    user_notes: str | None = None,
     history: list[dict[str, Any]],
     user_message: str,
     extra_system_context: str | None = None,
@@ -129,14 +172,21 @@ async def run_agent_turn(
     `on_stream_chunk(accumulated_text)` is invoked on every text delta. The
     caller is responsible for debouncing chat.update calls — we don't here.
     """
-    tracer = get_tracer()
-    today_iso = now_in(user_tz).date().isoformat()
+    now_local = now_in(user_tz)
+    today_iso = now_local.date().isoformat()
+    weekday = now_local.strftime("%A")
+    now_local_str = (
+        now_local.strftime("%-I:%M%p").replace("AM", "am").replace("PM", "pm")
+    )
     system_text = ASSISTANT_SYSTEM_PROMPT.format(
         user_name=user_name,
         tz=user_tz,
         today_iso=today_iso,
+        weekday=weekday,
+        now_local=now_local_str,
         work_start=workday_start,
         work_end=workday_end,
+        prompt_version=PROMPT_VERSION,
     )
     system_blocks: list[dict[str, Any]] = [
         {
@@ -147,15 +197,39 @@ async def run_agent_turn(
     ]
     # Per-turn extra context (e.g. "the user is in a /wrike thread, here are
     # the tasks they see"). Not cache-marked because it varies per turn.
+    if user_notes:
+        # Trim to keep prompt growth bounded. Notes are intentionally short.
+        notes_blob = user_notes.strip()
+        if len(notes_blob) > 1000:
+            notes_blob = notes_blob[:1000] + "…"
+        system_blocks.append(
+            {
+                "type": "text",
+                "text": (
+                    "[User notes (saved preferences / reminders for the "
+                    "assistant — apply where relevant):\n"
+                    + notes_blob
+                    + "]"
+                ),
+            }
+        )
     if extra_system_context:
         system_blocks.append({"type": "text", "text": extra_system_context})
+    else:
+        # Only pre-fetch upcoming events for general DM turns (not /wrike
+        # threads, where the dynamic context is already meaningful and we
+        # don't want to add latency). Failures are silent — the model can
+        # still call list_calendar_events itself.
+        upcoming = await _prefetch_upcoming_events_context(user_id, user_tz)
+        if upcoming:
+            system_blocks.append({"type": "text", "text": upcoming})
     tools = _tools_with_caching()
 
     messages: list[dict[str, Any]] = list(history) + [
         {"role": "user", "content": user_message}
     ]
 
-    with tracer.start_as_current_span("agent.turn") as span:
+    with start_span("agent.turn", kind=Kind.AGENT) as span:
         _set_session_attrs(
             span,
             user_id=user_id,
@@ -166,9 +240,10 @@ async def run_agent_turn(
             channel_id=channel_id,
             thread_ts=thread_ts,
         )
-        span.set_attribute("input.value", user_message)
-        span.set_attribute("input.mime_type", "text/plain")
+        span.set_attribute(SpanAttributes.INPUT_VALUE, user_message)
+        span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
         span.set_attribute("agent.model", settings.agent_model)
+        span.set_attribute("agent.prompt_version", PROMPT_VERSION)
         span.set_attribute("agent.history_messages", len(history))
 
         tools_used: list[str] = []
@@ -181,7 +256,7 @@ async def run_agent_turn(
         total_cache_create_tokens = 0
 
         for iteration in range(max_tool_iterations):
-            with tracer.start_as_current_span("agent.iteration") as it_span:
+            with start_span("agent.iteration", kind=Kind.CHAIN) as it_span:
                 it_span.set_attribute("iteration", iteration + 1)
 
                 accumulated_text = ""
@@ -238,8 +313,8 @@ async def run_agent_turn(
 
             if final.stop_reason != "tool_use" or not tool_uses:
                 final_text = "\n".join(p for p in text_parts if p).strip()
-                span.set_attribute("output.value", final_text or "(empty)")
-                span.set_attribute("output.mime_type", "text/plain")
+                span.set_attribute(SpanAttributes.OUTPUT_VALUE, final_text or "(empty)")
+                span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "text/plain")
                 span.set_attribute("agent.iterations", iteration + 1)
                 span.set_attribute("agent.tools_used", json.dumps(tools_used))
                 span.set_attribute("llm.token_count.prompt_total", total_input_tokens)
@@ -260,7 +335,16 @@ async def run_agent_turn(
                 tool_name = tu["name"]
                 tool_input = tu.get("input", {})
                 tools_used.append(tool_name)
-                with tracer.start_as_current_span(f"tool.{tool_name}") as ts:
+                tool_input_json = json.dumps(tool_input)[:8000]
+                with start_span(
+                    f"tool.{tool_name}",
+                    kind=Kind.TOOL,
+                    attributes={
+                        SpanAttributes.TOOL_NAME: tool_name,
+                        SpanAttributes.INPUT_VALUE: tool_input_json,
+                        SpanAttributes.INPUT_MIME_TYPE: "application/json",
+                    },
+                ) as ts:
                     _set_session_attrs(
                         ts,
                         user_id=user_id,
@@ -271,10 +355,7 @@ async def run_agent_turn(
                         channel_id=channel_id,
                         thread_ts=thread_ts,
                     )
-                    ts.set_attribute("tool.name", tool_name)
-                    ts.set_attribute("tool.input", json.dumps(tool_input)[:8000])
-                    ts.set_attribute("input.value", json.dumps(tool_input)[:8000])
-                    ts.set_attribute("input.mime_type", "application/json")
+                    ts.set_attribute("tool.input", tool_input_json)
                     is_error = False
                     try:
                         result = await dispatch_tool(
@@ -292,9 +373,10 @@ async def run_agent_turn(
                         result = {"error": str(exc)}
                         ts.set_status(trace.StatusCode.ERROR, str(exc))
                         is_error = True
-                    ts.set_attribute("tool.output", json.dumps(result, default=str)[:8000])
-                    ts.set_attribute("output.value", json.dumps(result, default=str)[:8000])
-                    ts.set_attribute("output.mime_type", "application/json")
+                    tool_output_json = json.dumps(result, default=str)[:8000]
+                    ts.set_attribute("tool.output", tool_output_json)
+                    ts.set_attribute(SpanAttributes.OUTPUT_VALUE, tool_output_json)
+                    ts.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "application/json")
                     if isinstance(result, dict) and result.get("preview"):
                         ts.set_attribute("tool.is_preview", True)
                         # Capture for the handler to build an Approve card.

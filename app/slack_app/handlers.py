@@ -127,6 +127,8 @@ def _approval_button_labels(action: dict) -> tuple[str, str]:
         return "✅ Post", alt_label
     if tool in {"update_wrike_task_status", "update_working_hours"}:
         return "✅ Update", alt_label
+    if tool == "update_user_notes":
+        return "✅ Save notes", alt_label
     return "✅ Confirm", alt_label
 
 
@@ -216,6 +218,7 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         )
         workday_start = user.workday_start
         workday_end = user.workday_end
+        user_notes = user.notes
 
     # Post the streaming placeholder in-thread.
     try:
@@ -251,6 +254,7 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             user_tz=tz,
             workday_start=workday_start,
             workday_end=workday_end,
+            user_notes=user_notes,
             history=history,
             user_message=text,
             extra_system_context=extra_context,

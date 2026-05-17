@@ -12,7 +12,11 @@ pass the bare base URL as `endpoint=`, and let it append `/v1/traces`.
 
 from __future__ import annotations
 
+from typing import Any, ContextManager
+
 from loguru import logger
+from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
+from opentelemetry.trace import Span
 
 from app.config import settings
 
@@ -76,3 +80,32 @@ def get_tracer():
     from opentelemetry import trace
 
     return trace.get_tracer("slack-assistant")
+
+
+def start_span(
+    name: str,
+    *,
+    kind: OpenInferenceSpanKindValues,
+    attributes: dict[str, Any] | None = None,
+) -> ContextManager[Span]:
+    """Start a current span tagged with the right OpenInference kind so it
+    renders correctly in the Phoenix UI (Agent / Chain / Tool / LLM …
+    instead of "unknown").
+
+    Wraps `tracer.start_as_current_span` directly — returns whatever the
+    OTel API returns (a context manager). NOT decorated with
+    `@contextmanager`: doing so would yield the generator and break the
+    `with start_span(...) as span:` ergonomic where `span` is the Span.
+
+    Use the OpenInferenceSpanKindValues enum (`Kind.AGENT`, `Kind.CHAIN`,
+    `Kind.TOOL`, …); the helper handles the `.value` unwrap.
+
+    Anthropic-SDK spans are NOT routed through here — the
+    AnthropicInstrumentor sets `LLM` on them internally.
+    """
+    merged: dict[str, Any] = {
+        SpanAttributes.OPENINFERENCE_SPAN_KIND: kind.value,
+    }
+    if attributes:
+        merged.update(attributes)
+    return get_tracer().start_as_current_span(name, attributes=merged)

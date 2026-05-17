@@ -33,6 +33,11 @@ class User(SQLModel, table=True):
     tz: str | None = None  # e.g. "America/Los_Angeles"
     workday_start: str = "09:00"
     workday_end: str = "18:00"
+    # Free-form user preferences (e.g. "I prefer 30-min focus blocks",
+    # "always schedule on Wednesdays") that the assistant should keep in
+    # mind across conversations. Edited via update_user_notes / cleared
+    # via the same tool with an empty string.
+    notes: str | None = None
     # Tracks the most recent /connect card we posted so we can clean it up
     # once all three integrations are connected.
     connect_card_channel_id: str | None = None

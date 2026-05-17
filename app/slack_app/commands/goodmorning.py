@@ -15,7 +15,10 @@ from app.formatters.briefing import briefing_blocks
 from app.integrations import google_calendar as gcal
 from app.integrations import slack_search
 from app.integrations import wrike as wrike_int
-from app.observability import get_tracer
+from openinference.semconv.trace import OpenInferenceSpanKindValues as Kind
+from openinference.semconv.trace import SpanAttributes
+
+from app.observability import start_span
 from app.slack_app.connection_status import status_for
 from app.utils.timezone import end_of_day, now_in, start_of_day
 from app.utils.working_hours import (
@@ -190,8 +193,7 @@ def register(app):
             if not status.slack_user_token:
                 missing.append("Slack search")
 
-            tracer = get_tracer()
-            with tracer.start_as_current_span("command.goodmorning") as span:
+            with start_span("command.goodmorning", kind=Kind.CHAIN) as span:
                 # Rich attributes for Phoenix
                 span.set_attribute("user.id", slack_user_id)
                 span.set_attribute("user.name", real_name or "")
@@ -202,8 +204,8 @@ def register(app):
                 span.set_attribute("user.team_id", slack_team_id)
                 span.set_attribute("session.id", f"goodmorning:{slack_user_id}")
                 span.set_attribute("command.name", "/goodmorning")
-                span.set_attribute("input.value", "/goodmorning")
-                span.set_attribute("input.mime_type", "text/plain")
+                span.set_attribute(SpanAttributes.INPUT_VALUE, "/goodmorning")
+                span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
 
                 mentions, wrike_pair, cal_data = await asyncio.gather(
                     _fetch_mentions(user_id=user_id, slack_user_id=slack_user_id),  # type: ignore[arg-type]

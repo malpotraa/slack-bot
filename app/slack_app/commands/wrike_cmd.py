@@ -13,7 +13,10 @@ from app.formatters import wrike_blocks as wb
 from app.integrations import google_calendar as gcal
 from app.integrations import wrike as wrike_int
 from app.llm.extract_schedule import extract_schedule_intent
-from app.observability import get_tracer
+from openinference.semconv.trace import OpenInferenceSpanKindValues as Kind
+from openinference.semconv.trace import SpanAttributes
+
+from app.observability import start_span
 from app.sessions import store as session_store
 from app.slack_app.approval import build_approval_blocks_with_alternates
 from app.utils.timezone import end_of_day, now_in, start_of_day, user_tz
@@ -116,8 +119,7 @@ def register(app):
             workday_start = user.workday_start
             workday_end = user.workday_end
 
-        tracer = get_tracer()
-        with tracer.start_as_current_span("command.wrike.start") as span:
+        with start_span("command.wrike.start", kind=Kind.CHAIN) as span:
             span.set_attribute("user.id", slack_user_id)
             span.set_attribute("user.name", real_name or "")
             if email:
@@ -127,8 +129,8 @@ def register(app):
             span.set_attribute("user.team_id", slack_team_id)
             span.set_attribute("session.id", f"wrike:{slack_user_id}")
             span.set_attribute("command.name", "/wrike")
-            span.set_attribute("input.value", "/wrike")
-            span.set_attribute("input.mime_type", "text/plain")
+            span.set_attribute(SpanAttributes.INPUT_VALUE, "/wrike")
+            span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
 
             # All conversation happens in the bot's DM with the user.
             dm = await client.conversations_open(users=slack_user_id)
@@ -246,12 +248,23 @@ def _looks_like_non_scheduling(text: str, state: dict) -> bool:
 
 def build_task_list_context(tasks: list[dict]) -> str:
     """Build extra-system-context the conversational agent sees so it can map
-    'task #N' or 'task 15' references to the right Wrike API task_id."""
+    'task #N' or 'task 15' references to the right Wrike API task_id.
+
+    Also re-states the Wrike URL handling rule here (rather than in the main
+    system prompt) since the user is only likely to paste a Wrike URL in a
+    /wrike thread context.
+    """
     lines = [
         "[Context: the user is replying inside a /wrike task list. They may "
         "reference tasks by their list number (1-based) or by title. Resolve "
-        "any 'task #N' references to the corresponding Wrike API task_id "
-        "below, then pass that task_id to Wrike tools.]",
+        "any 'task #N' / 'task 15' / 'the K+S Potash one' references to the "
+        "task_id below, then pass that task_id to Wrike tools.]",
+        "",
+        "[Wrike URLs the user pastes use a numeric id in the URL (e.g. "
+        "id=4449467731) which is NOT the API id. Pass the FULL URL as "
+        "`task_ref` to any Wrike tool — the server resolves it to the "
+        "alphanumeric API id (e.g. IEAA4BCD). Never use the numeric URL id "
+        "directly.]",
         "",
         "Task list currently shown to user:",
     ]
@@ -322,7 +335,11 @@ async def _handle_thread_turn(
 
     # Parse intent
     intent = await extract_schedule_intent(
-        user_message=user_text, candidate_tasks=tasks, tz_name=tz_name
+        user_message=user_text,
+        candidate_tasks=tasks,
+        tz_name=tz_name,
+        work_start=state.get("workday_start") or "09:00",
+        work_end=state.get("workday_end") or "18:00",
     )
 
     # Merge with anything already stored in state (sticky slot filling)

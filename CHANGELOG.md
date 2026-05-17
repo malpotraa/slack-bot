@@ -8,7 +8,90 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.6.2`) is what's queued for deploy.
+Nothing pending right now. The previous release (`v1.7.1`) is what's queued for deploy.
+
+---
+
+## [1.7.1] — 2026-05-17
+
+Phoenix telemetry fix: our custom spans were rendering as `kind: unknown` because they didn't set the OpenInference span-kind attribute. The Anthropic SDK's auto-instrumented spans had this for free; our own didn't.
+
+### Added
+
+- **`start_span(name, *, kind, attributes=None)`** helper in `app/observability.py`. Wraps `tracer.start_as_current_span` and sets `openinference.span.kind` from the typed `OpenInferenceSpanKindValues` enum at span-start (so samplers / exporters see it too). Returns the OTel context manager directly — not decorated with `@contextmanager`, so `with start_span(...) as span:` binds the actual `Span`, not a generator.
+
+### Changed
+
+- **Span call sites switched to `start_span`** with explicit kinds:
+  - `agent.turn` → `AGENT` (autonomous, tool-using).
+  - `agent.iteration` → `CHAIN` (single LLM round-trip + tool dispatch loop step).
+  - `tool.<name>` → `TOOL` (each `dispatch_tool` invocation).
+  - `command.wrike.start` → `CHAIN` (deterministic command handler that orchestrates a slot-filling flow; the nested `agent.turn` carries the AGENT kind).
+  - `command.goodmorning` → `CHAIN` (pure deterministic fetch + format).
+- **Span input/output attributes use semconv constants** instead of raw strings — `SpanAttributes.INPUT_VALUE` / `INPUT_MIME_TYPE` / `OUTPUT_VALUE` / `OUTPUT_MIME_TYPE` / `TOOL_NAME` from `openinference.semconv.trace`. Phoenix renders the `Input` / `Output` columns from these; the prior bare-string keys happened to match by coincidence — using the constants makes that explicit and stable across openinference-semconv updates.
+- **Tool-input JSON serialised once** instead of three times in the tool-dispatch loop (small cleanup that fell out of the helper refactor).
+
+### Why & tradeoffs
+
+- *Why one helper, not five call-site edits?* Five sites today, more tomorrow — every new top-level operation we trace is one more place to forget the kind attribute. Centralising the convention in `start_span` makes the right thing the default and the wrong thing impossible (the helper requires `kind` as a kwarg).
+- *Why pass `kind` as the enum, not a string?* The user explicitly asked for semconv constants. Bonus: type-checkers and IDEs catch typos at edit time (`Kind.AGNT` won't resolve); raw strings (`"agnt"`) ship to prod silently.
+- *Why both `command.*` spans are `CHAIN`, not `AGENT`?* AGENT is for autonomous tool-using flows. Both slash-command handlers are deterministic state machines that *contain* an agent call (which gets its own `agent.turn` span). The trace tree reads correctly: `command.wrike.start` (CHAIN) → `agent.turn` (AGENT) → `tool.list_wrike_tasks` (TOOL) → Anthropic LLM spans (LLM).
+- *Anthropic SDK spans untouched.* `AnthropicInstrumentor` sets `LLM` on its own spans internally; routing them through our helper would double-tag them.
+- *No behaviour change* — telemetry only. Safe to deploy without the DB migration; just rebuilds the image.
+
+---
+
+## [1.7.0] — 2026-05-17
+
+Big prompt + context overhaul. A through Z (26 items) implemented as a coordinated revision. Bumps `PROMPT_VERSION` to `1.7.0-2026-05-17`, surfaced as the new `agent.prompt_version` Phoenix span attribute.
+
+### Pre-deploy migration (required)
+
+```bash
+gcloud sql connect slack-assistant-pg --user=app --database=slack_assistant
+> ALTER TABLE "user" ADD COLUMN IF NOT EXISTS notes TEXT;
+```
+
+Code in this release reads `user.notes`; running the new container against a pre-migration DB will raise `UndefinedColumn`. Script: `infrastructure/09-migrate-add-user-notes.sh`.
+
+### Added
+
+- **`PROMPT_VERSION` constant** in `app/agent/prompts.py` + Phoenix `agent.prompt_version` attribute on every `agent.turn` span so traces can attribute behaviour to a specific prompt revision.
+- **Dynamic time context**: `weekday`, `now_local` (local time of day in `9:43pm` format) now passed into the system prompt alongside `today_iso`. Fixes silent "what day is it?" reasoning errors and lets the model handle "in an hour" without re-deriving the date.
+- **`get_user_notes` / `update_user_notes` tools** (`app/agent/tools.py`). Free-form preferences ("I like 30-min focus blocks", "always schedule on Wednesdays") that the assistant remembers across conversations. Capped at 1000 chars. `update_user_notes` follows the two-phase approval pattern, primary button reads "✅ Save notes". `update_user_notes` added to `WRITE_TOOL_ALLOWLIST`.
+- **`User.notes` column** (`app/db/models.py`). Nullable TEXT, free-form. Migration in `infrastructure/09-migrate-add-user-notes.sh`.
+- **Calendar pre-fetch** (`app/agent/runner.py:_prefetch_upcoming_events_context`). Best-effort load of the next 8 hours of events; inserted as ephemeral system context. Runs only on general DM turns (skipped when a `/wrike` thread context is already set). Failures swallowed — model can still call `list_calendar_events` for itself.
+- **Settled-action history** (`app/sessions/store.py:append_settled_action`). When the user clicks Approve / Use alternate / Cancel on an approval card, the outcome is appended to the thread's conversation history as a synthetic user+assistant pair. Lets the next turn ("do that again for next week") reference the previous action without inventing arbitrary plumbing.
+- **`work_start` / `work_end` substitution into the slot extractor prompt** (`app/agent/prompts.py:SLOT_EXTRACTION_SYSTEM_PROMPT` + `app/llm/extract_schedule.py`). Makes "first thing" / "end of day" defaults respect the user's actual hours instead of hardcoded `09:00` / `17:00`.
+
+### Changed
+
+- **`ASSISTANT_SYSTEM_PROMPT` rewritten** in `app/agent/prompts.py`:
+  - Sections renamed from `═══ HEADER ═══` to `## HEADER` (tighter tokenization; same visual segmentation).
+  - `EXAMPLES` section dropped (covered by tool descriptions; Sonnet 4.6 doesn't need them).
+  - `SLACK FORMATTING` compressed from 9 lines to 3.
+  - `WRIKE TASKS — IDs vs URLs` section removed; the rule now lives in (a) the `task_id` parameter description on every Wrike tool, and (b) the `/wrike` thread's `build_task_list_context` dynamic block. Saves ~80 tokens × every turn outside a `/wrike` thread.
+  - New sections: `ERROR HANDLING` (one-sentence summary + suggest `/connect` if NotConnected; no retry), `TIME REASONING` (anchor on TODAY/now; explicit time format `9:45am` / `9:45–10:15am`), `DISAMBIGUATION` (list candidates as numbered bullets), `ACCURACY` (no inventing titles / IDs / times), updated `TURN BUDGET` (4 turns + write tools self-check note).
+  - `APPROVAL FLOW` adds: multi-write turns propose each as its own preview call; after approval the card shows outcome, don't re-acknowledge in chat.
+  - `HARD SCOPE` refusal phrasing now offers one nearby thing the assistant CAN do; includes `DO NOT` worked examples.
+  - Canonical answer pinned for "what can you do?".
+- **`SLOT_EXTRACTION_SYSTEM_PROMPT`** gained explicit time-of-day mappings (morning/afternoon/evening/end-of-day/first-thing), a `force_overlap` example ("schedule it anyway"), and reads `{work_start}` / `{work_end}` for personalised defaults.
+- **`HISTORY_SUMMARY_SYSTEM_PROMPT`** gained verbatim-preservation rules (event IDs, Wrike task IDs, times) and a 200-word ceiling that drops oldest details first.
+- **Wrike tool `task_id` parameter description** in `app/agent/tools.py` explicitly warns against passing the numeric URL id; the rule moved here from the system prompt (`l`).
+- **`/wrike` task-list extra-context** (`app/slack_app/commands/wrike_cmd.py:build_task_list_context`) now embeds the Wrike URL handling rule and the `#N` reference resolution rule. These only apply inside `/wrike` threads, so they no longer ride along on every other turn.
+- **`run_agent_turn` signature** in `app/agent/runner.py` adds `user_notes: str | None`; `extract_schedule_intent` adds `work_start` / `work_end` kwargs (both backwards-compatible defaults).
+
+### Why & tradeoffs
+
+- *Why one big release for 26 items?* Most items are pure-text prompt edits and only break each other when placeholders are added without coordinated caller updates. Phase 1 of the rollout pre-passed all the new kwargs to `.format()` (silently unused), then Phase 2 rewrote the prompt to consume them — by the time the prompt referenced `{weekday}`, the runner was already passing it. Same trick for `{work_start}` in the slot extractor.
+- *Why move `/wrike URL` rule out of the system prompt?* That rule only fires when the user is interacting with Wrike, but it loaded on every DM turn (calendar queries, mention searches, everything). Moving it into the relevant tool descriptions (which Anthropic also caches) and the `/wrike` thread's dynamic context puts the rule where it's needed and saves ~80 tokens × every non-Wrike turn.
+- *Why pre-fetch the calendar?* Trivial questions like "what's next?" / "what's after my 10am?" took two roundtrips (model → list_calendar_events → text). Pre-fetching 8 hours of events as ephemeral context turns those into one roundtrip with a ~300ms upfront cost. Skipped on `/wrike` turns because those have their own meaningful context and the pre-fetch would add latency without value. Failure-tolerant — `list_events` is still always callable for longer ranges.
+- *Why "settled action" entries in history (option v)?* The session history is the only persistent state the model sees turn-to-turn. Tool results aren't kept across turns by design (would balloon the prompt). Without this, "do that again for next week" had no anchor — the model didn't even know the previous action settled, let alone what it was. Two synthetic messages per click is cheap; the rolling-summary compressor already preserves identifiers verbatim.
+- *Why user notes as a single free-form column rather than structured preferences?* Three reasons. (1) The shape of useful preferences is unknown — "I like 30-min focus blocks", "block Fridays for deep work", "default duration 45 min" are heterogeneous; a JSON schema would lock in too early. (2) Free-form text the model edits is self-documenting and the user can read/audit it. (3) It composes naturally with the existing two-phase approval pattern — `update_user_notes("...new full text...", confirmed=false)` is the same shape as every other write. The 1000-char cap keeps prompt growth bounded.
+- *Why mention `notes` in the `update_user_notes` description as "REPLACES any existing notes"?* The model would otherwise routinely overwrite when intending to append. Tools don't have a `patch` semantic for free-form text without exploding the schema. Telling the model to read-first-then-write keeps the contract simple and matches what the user expects (see card preview).
+- *Token budget impact:* The non-`/wrike` always-on system prompt is now ~4.9k chars (~1100 tokens) vs the previous ~4.4k (~1000 tokens). The new sections (ERROR HANDLING, TIME REASONING, DISAMBIGUATION, ACCURACY) add some weight, but the removal of EXAMPLES and the Wrike URL block roughly offsets it. With prompt caching, the marginal cost is near-zero after the first turn.
+- *DB migration risk:* Adding a NULL column is the safest schema change — backwards-compatible with the prior container. Deploy order: run migration first (idempotent, `IF NOT EXISTS`), then `04-build-and-deploy.sh`. The container probes `user.notes` lazily (only when an agent turn fires), so a brief window without the column would only break new agent turns, not `/connect` or OAuth callbacks.
+- *What's still deferred:* per-day working hours; cross-thread shared memory of approvals (currently a settled action only seeds the thread it was approved in); structured (schema'd) user preferences. All documented in `claude.md` "Planned work".
 
 ---
 

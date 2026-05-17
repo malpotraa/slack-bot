@@ -23,6 +23,7 @@ from app.agent.tools import dispatch_tool
 from app.config import settings
 from app.db.engine import session_scope
 from app.db.users import get_user_by_slack_id
+from app.sessions import store as session_store
 
 
 APPROVE_ACTION_ID = "agent_approve"
@@ -42,6 +43,7 @@ WRITE_TOOL_ALLOWLIST: set[str] = {
     "post_wrike_task_comment",
     "schedule_wrike_task",
     "update_working_hours",
+    "update_user_notes",
 }
 
 
@@ -267,6 +269,8 @@ async def _handle_approve_click(body, client) -> None:
         msg = result.get("message") or "Done."
         text = f"✅ {msg}"
         blocks = _settled_blocks("✅", f"*Approved.* {msg}")
+        outcome = "approved"
+        summary = msg
     else:
         err = (
             result.get("error", "Unknown error")
@@ -275,11 +279,27 @@ async def _handle_approve_click(body, client) -> None:
         )
         text = f"⚠️ Failed: {err}"
         blocks = _settled_blocks("⚠️", f"*Failed.* {err}")
+        outcome = "failed"
+        summary = err
 
     try:
         await client.chat_update(channel=channel_id, ts=message_ts, text=text, blocks=blocks)
     except SlackApiError as exc:
         logger.warning(f"approve: chat_update failed: {exc}")
+
+    # Best-effort: record the settled outcome into thread history so the next
+    # agent turn ("do that again for next week") has context.
+    thread_ts = body.get("message", {}).get("thread_ts") or message_ts
+    try:
+        await session_store.append_settled_action(
+            user_id=ctx["user_id"],
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            outcome=outcome,
+            summary=summary,
+        )
+    except Exception as exc:
+        logger.warning(f"approve: history append failed: {exc}")
 
 
 def register(app) -> None:
@@ -307,3 +327,23 @@ def register(app) -> None:
             )
         except SlackApiError as exc:
             logger.warning(f"disapprove: chat_update failed: {exc}")
+        # Record cancellation into thread history.
+        slack_user_id = body["user"]["id"]
+        slack_team_id = (
+            body.get("team", {}).get("id")
+            or body.get("user", {}).get("team_id")
+            or ""
+        )
+        thread_ts = body.get("message", {}).get("thread_ts") or message_ts
+        try:
+            ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
+            if ctx is not None:
+                await session_store.append_settled_action(
+                    user_id=ctx["user_id"],
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    outcome="cancelled",
+                    summary="user cancelled the proposed action",
+                )
+        except Exception as exc:
+            logger.warning(f"disapprove: history append failed: {exc}")

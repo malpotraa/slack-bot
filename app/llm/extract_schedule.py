@@ -40,12 +40,18 @@ async def extract_schedule_intent(
     user_message: str,
     candidate_tasks: list[dict],
     tz_name: str,
+    work_start: str = "09:00",
+    work_end: str = "18:00",
 ) -> ScheduleIntent:
     today_iso = now_in(tz_name).date().isoformat()
     # Use .replace() instead of .format() so literal {} in the prompt's example
     # JSON output isn't treated as format placeholders.
-    system = SLOT_EXTRACTION_SYSTEM_PROMPT.replace("{today_iso}", today_iso).replace(
-        "{tz}", tz_name
+    system = (
+        SLOT_EXTRACTION_SYSTEM_PROMPT
+        .replace("{today_iso}", today_iso)
+        .replace("{tz}", tz_name)
+        .replace("{work_start}", work_start)
+        .replace("{work_end}", work_end)
     )
 
     candidate_block = "\n".join(

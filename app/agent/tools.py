@@ -139,7 +139,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD').",
+                    "description": (
+                        "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD'). "
+                        "DO NOT pass the numeric id from a Wrike URL "
+                        "(e.g. '4449467731') — that is not the API id; "
+                        "use `task_ref` for URLs."
+                    ),
                 },
                 "task_ref": {
                     "type": "string",
@@ -166,7 +171,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD').",
+                    "description": (
+                        "Alphanumeric Wrike API task id (e.g. 'IEAA4BCD'). "
+                        "DO NOT pass the numeric id from a Wrike URL "
+                        "(e.g. '4449467731') — that is not the API id; "
+                        "use `task_ref` for URLs."
+                    ),
                 },
                 "task_ref": {
                     "type": "string",
@@ -269,6 +279,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": "Read the user's currently saved working-hours window.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "get_user_notes",
+        "description": (
+            "Read the user's saved free-form notes / preferences "
+            "(e.g. 'I like 30-min focus blocks'). Read-only."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "update_user_notes",
+        "description": (
+            "Save / replace the user's free-form notes (preferences, "
+            "context, reminders for the assistant). The new text REPLACES "
+            "any existing notes — to add to existing notes, call "
+            "get_user_notes first and pass the combined text. Pass an "
+            "empty string to clear. Call FIRST with confirmed=false for "
+            "a preview, then confirmed=true after the user approves."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["notes", "confirmed"],
+            "properties": {
+                "notes": {
+                    "type": "string",
+                    "description": "Full replacement text (up to ~1000 chars). Empty to clear.",
+                },
+                "confirmed": {"type": "boolean"},
+            },
+        },
+    },
 ]
 
 
@@ -320,6 +360,10 @@ async def dispatch_tool(
         return await _update_working_hours(inputs, user_id=user_id)
     if name == "get_working_hours":
         return await _get_working_hours(user_id=user_id)
+    if name == "get_user_notes":
+        return await _get_user_notes(user_id=user_id)
+    if name == "update_user_notes":
+        return await _update_user_notes(inputs, user_id=user_id)
     if name == "schedule_wrike_task":
         return await _schedule_wrike_task(inputs, user_id=user_id)
     raise ValueError(f"Unknown / disallowed tool: {name}")
@@ -973,6 +1017,63 @@ async def _get_working_hours(*, user_id: int) -> dict:
         if user is None:
             return {"error": "User not found."}
         return {"work_start": user.workday_start, "work_end": user.workday_end}
+
+
+_USER_NOTES_MAX_CHARS = 1000
+
+
+async def _get_user_notes(*, user_id: int) -> dict:
+    from app.db.engine import session_scope
+    from app.db.models import User
+
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return {"error": "User not found."}
+        return {"notes": user.notes or ""}
+
+
+async def _update_user_notes(inputs: dict, *, user_id: int) -> dict:
+    raw = inputs.get("notes")
+    if raw is None:
+        return {"error": "Missing `notes`."}
+    notes = str(raw).strip()
+    if len(notes) > _USER_NOTES_MAX_CHARS:
+        return {
+            "error": (
+                f"Notes too long ({len(notes)} chars). "
+                f"Keep under {_USER_NOTES_MAX_CHARS} characters."
+            )
+        }
+    confirmed = bool(inputs.get("confirmed"))
+
+    if not confirmed:
+        if not notes:
+            summary = "Clear your saved notes."
+        else:
+            preview = notes if len(notes) <= 200 else notes[:200] + "…"
+            summary = f"Save new notes:\n> {preview}"
+        return {
+            "preview": True,
+            "summary_for_user": summary,
+            "next_action": (
+                "On approval, call update_user_notes again with the same "
+                "text and confirmed=true."
+            ),
+        }
+
+    from app.db.engine import session_scope
+    from app.db.models import User
+
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return {"error": "User not found."}
+        user.notes = notes or None
+        session.add(user)
+
+    msg = "Notes cleared." if not notes else "Notes saved."
+    return {"ok": True, "message": msg}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
