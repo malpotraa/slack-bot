@@ -27,8 +27,10 @@ fi
 # ── 2. Set the postgres root password (idempotent) ────────────────────────
 PG_ROOT_PASSWORD_FILE="/tmp/${SERVICE_NAME}-pg-root.pwd"
 if [[ ! -f "${PG_ROOT_PASSWORD_FILE}" ]]; then
+  umask 077
   openssl rand -base64 32 > "${PG_ROOT_PASSWORD_FILE}"
 fi
+chmod 600 "${PG_ROOT_PASSWORD_FILE}"
 PG_ROOT_PASSWORD="$(cat "${PG_ROOT_PASSWORD_FILE}")"
 gcloud sql users set-password postgres \
   --instance="${SQL_INSTANCE}" \
@@ -46,8 +48,7 @@ fi
 # ── 4. Create the application user ────────────────────────────────────────
 if [[ -z "${SQL_DB_PASSWORD}" ]]; then
   SQL_DB_PASSWORD="$(openssl rand -base64 32 | tr -d '=+/')"
-  echo "ℹ Generated SQL_DB_PASSWORD; printing once below — copy now."
-  echo "    SQL_DB_PASSWORD='${SQL_DB_PASSWORD}'"
+  echo "ℹ Generated SQL_DB_PASSWORD and embedded it in the DATABASE_URL file below."
 fi
 
 if gcloud sql users describe "${SQL_DB_USER}" --instance="${SQL_INSTANCE}" >/dev/null 2>&1; then
@@ -71,12 +72,10 @@ echo "   Connection name: ${SQL_CONNECTION_NAME}"
 echo "   Database:        ${SQL_DB_NAME}"
 echo "   User:            ${SQL_DB_USER}"
 echo
-echo "   Use this DATABASE_URL when running 02-create-secrets.sh:"
-echo
-echo "       export DATABASE_URL='${DB_URL}'"
-echo
-
-# Save it to disk so step 02 can pick it up automatically.
+# Save it to disk so you can copy it into infrastructure-secrets.env.
 DB_URL_FILE="/tmp/${SERVICE_NAME}-database-url"
+umask 077
 printf '%s' "${DB_URL}" > "${DB_URL_FILE}"
-echo "(also written to ${DB_URL_FILE})"
+chmod 600 "${DB_URL_FILE}"
+echo "   DATABASE_URL written to ${DB_URL_FILE} (mode 600)."
+echo "   Copy it into infrastructure-secrets.env, then delete the file when done."

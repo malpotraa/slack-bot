@@ -5,6 +5,10 @@ __pycache__/
 .gitignore
 .env
 .env.*
+infrastructure-secrets.env
+infrastructure/secrets.env
+*.pem
+*.key
 data/
 *.log
 docs/

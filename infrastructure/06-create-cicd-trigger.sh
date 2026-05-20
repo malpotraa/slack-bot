@@ -22,6 +22,7 @@ GITHUB_REPO="${GITHUB_REPO:-}"            # e.g. "slack-assistant" (just the rep
 GITHUB_BRANCH="${GITHUB_BRANCH:-^main$}"  # regex; default = main branch only
 TRIGGER_NAME="${TRIGGER_NAME:-${SERVICE_NAME}-deploy}"
 APP_BASE_URL="${APP_BASE_URL:-}"          # e.g. https://slack-assistant-abcd-uc.a.run.app
+RUN_SA_EMAIL="${RUN_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 if [[ -z "${GITHUB_OWNER}" || -z "${GITHUB_REPO}" || -z "${APP_BASE_URL}" ]]; then
   cat <<EOF
@@ -57,7 +58,7 @@ gcloud builds triggers create github \
   --branch-pattern="${GITHUB_BRANCH}" \
   --build-config="prod/cloudbuild.yaml" \
   --included-files="prod/**" \
-  --substitutions="_REGION=${REGION},_SERVICE_NAME=${SERVICE_NAME},_AR_REPO=${AR_REPO},_SQL_INSTANCE=${SQL_CONNECTION_NAME},_APP_BASE_URL=${APP_BASE_URL}" \
+  --substitutions="_REGION=${REGION},_SERVICE_NAME=${SERVICE_NAME},_AR_REPO=${AR_REPO},_SQL_INSTANCE=${SQL_CONNECTION_NAME},_APP_BASE_URL=${APP_BASE_URL},_RUN_SA_EMAIL=${RUN_SA_EMAIL}" \
   --description="Auto-deploy ${SERVICE_NAME} from main on prod/** changes"
 
 echo

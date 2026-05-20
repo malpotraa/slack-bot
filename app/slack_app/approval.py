@@ -14,16 +14,21 @@ Slack's per-value limit is 2000 chars; our tool args are well under that.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from slack_sdk.errors import SlackApiError
+from sqlmodel import select
 
 from app.agent.tools import dispatch_tool
 from app.config import settings
-from app.db.engine import session_scope
+from app.db.engine import session_factory, session_scope
+from app.db.models import ApprovalExecution
 from app.db.users import get_user_by_slack_id
 from app.sessions import store as session_store
+from app.utils.slack_mrkdwn import escape_slack_text
 
 
 APPROVE_ACTION_ID = "agent_approve"
@@ -45,6 +50,14 @@ WRITE_TOOL_ALLOWLIST: set[str] = {
     "update_working_hours",
     "update_user_notes",
 }
+APPROVED_READ_TOOL_ALLOWLIST: set[str] = {
+    "fetch_google_ads_kpis",
+}
+APPROVAL_TOOL_ALLOWLIST = WRITE_TOOL_ALLOWLIST | APPROVED_READ_TOOL_ALLOWLIST
+
+# Every approval card opens with this header so the agent, /wrike, and /kpi
+# all post a visually consistent card. Pass intro_text="" to suppress it.
+DEFAULT_APPROVAL_INTRO = "🔔 *Approval needed*"
 
 
 def build_approval_blocks(
@@ -56,10 +69,13 @@ def build_approval_blocks(
 ) -> list[dict[str, Any]]:
     """Build Block Kit blocks for the approval card (no alternate / no conflict).
 
-    intro_text: optional framing line; omit for a tighter card.
+    intro_text: framing line; defaults to a standard "🔔 Approval needed"
+        header. Pass intro_text="" to suppress it.
     pending_actions: list of {tool, args, summary} dicts from the runner.
     """
     blocks: list[dict[str, Any]] = []
+    if intro_text is None:
+        intro_text = DEFAULT_APPROVAL_INTRO
     if intro_text:
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": intro_text}}
@@ -120,11 +136,12 @@ def build_approval_blocks_with_alternates(
     primary: {tool, args, summary}
     alternate: optional second {tool, args, summary, short_time}
         (e.g. the suggested free slot when the proposed slot overlaps)
-    intro_text: optional framing line. The conversational-agent card omits
-        this since the primary summary already carries the title + context.
-        The /wrike command supplies an "Overlap detected" intro.
+    intro_text: framing line; defaults to a standard "🔔 Approval needed"
+        header. The /wrike overlap path supplies its own combined intro.
     """
     blocks: list[dict[str, Any]] = []
+    if intro_text is None:
+        intro_text = DEFAULT_APPROVAL_INTRO
     if intro_text:
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": intro_text}}
@@ -190,6 +207,80 @@ async def _resolve_user_ctx(slack_team_id: str, slack_user_id: str):
         }
 
 
+def _approval_key(slack_team_id: str, channel_id: str, message_ts: str) -> str:
+    return f"{slack_team_id}:{channel_id}:{message_ts}"
+
+
+def _is_approval_key_conflict(exc: IntegrityError) -> bool:
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate == "23505":
+        text = str(orig).lower()
+        return "approval_key" in text or "approvalexecution" in text
+    text = str(exc).lower()
+    return (
+        "approvalexecution.approval_key" in text
+        or "uq" in text and "approval" in text and "approval_key" in text
+    )
+
+
+async def _claim_approval(
+    *,
+    approval_key: str,
+    user_id: int,
+    slack_team_id: str,
+    slack_user_id: str,
+    channel_id: str,
+    message_ts: str,
+    action_id: str,
+    tool_name: str,
+) -> bool:
+    """Atomically claim a card so retries/double-clicks cannot run twice."""
+    session_maker = session_factory()
+    async with session_maker() as session:
+        session.add(
+            ApprovalExecution(
+                approval_key=approval_key,
+                user_id=user_id,
+                slack_team_id=slack_team_id,
+                slack_user_id=slack_user_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                action_id=action_id,
+                tool_name=tool_name,
+            )
+        )
+        try:
+            await session.commit()
+            return True
+        except IntegrityError as exc:
+            await session.rollback()
+            if not _is_approval_key_conflict(exc):
+                raise
+            return False
+
+
+async def _mark_approval_status(
+    approval_key: str, status: str, *, error: str | None = None
+) -> None:
+    session_maker = session_factory()
+    async with session_maker() as session:
+        row = (
+            await session.exec(
+                select(ApprovalExecution).where(
+                    ApprovalExecution.approval_key == approval_key
+                )
+            )
+        ).first()
+        if row is None:
+            return
+        row.status = status
+        row.error = error[:500] if error else None
+        row.updated_at = datetime.now(UTC)
+        session.add(row)
+        await session.commit()
+
+
 def _settled_blocks(emoji: str, msg: str) -> list[dict[str, Any]]:
     """The card after Approve / Disapprove is clicked — no more buttons."""
     return [
@@ -200,14 +291,33 @@ def _settled_blocks(emoji: str, msg: str) -> list[dict[str, Any]]:
     ]
 
 
+def _working_blocks(tool_name: str, summary: str) -> list[dict[str, Any]]:
+    if tool_name == "fetch_google_ads_kpis":
+        return [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "⏳ *Fetching Google Ads KPI report...*\n"
+                        "Pulling campaign performance and keyword drivers now."
+                    ),
+                },
+            },
+        ]
+    return _settled_blocks("⏳", f"*Working...* {escape_slack_text(summary)}")
+
+
 async def _handle_approve_click(body, client) -> None:
     try:
-        payload = json.loads(body["actions"][0]["value"])
+        action = body["actions"][0]
+        payload = json.loads(action["value"])
     except Exception as exc:
         logger.warning(f"approve: bad payload: {exc}")
         return
 
     tool_name = payload.get("tool")
+    payload_summary = payload.get("summary") or ""
     args = dict(payload.get("args") or {})
     args["confirmed"] = True
 
@@ -217,12 +327,13 @@ async def _handle_approve_click(body, client) -> None:
     )
     channel_id = body["channel"]["id"]
     message_ts = body["message"]["ts"]
+    approval_key = _approval_key(slack_team_id, channel_id, message_ts)
 
-    # Allow-list guard: refuse to dispatch anything not on the known write-tool
+    # Allow-list guard: refuse to dispatch anything not on the known approved-tool
     # list, no matter what the payload says. Logs the attempt for auditability.
-    if tool_name not in WRITE_TOOL_ALLOWLIST:
+    if tool_name not in APPROVAL_TOOL_ALLOWLIST:
         logger.warning(
-            f"approval rejected: tool {tool_name!r} not in WRITE_TOOL_ALLOWLIST; "
+            f"approval rejected: tool {tool_name!r} not in APPROVAL_TOOL_ALLOWLIST; "
             f"clicker={slack_user_id} channel={channel_id} ts={message_ts}"
         )
         try:
@@ -251,6 +362,45 @@ async def _handle_approve_click(body, client) -> None:
         return
 
     try:
+        claimed = await _claim_approval(
+            approval_key=approval_key,
+            user_id=ctx["user_id"],
+            slack_team_id=slack_team_id,
+            slack_user_id=slack_user_id,
+            channel_id=channel_id,
+            message_ts=message_ts,
+            action_id=action.get("action_id") or "",
+            tool_name=str(tool_name),
+        )
+    except IntegrityError as exc:
+        logger.exception(f"approval claim failed: {exc}")
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text="⚠️ Could not claim this approval; please re-run the request.",
+            blocks=_settled_blocks(
+                "⚠️", "*Failed.* Could not claim this approval; please re-run the request."
+            ),
+        )
+        return
+    if not claimed:
+        logger.info(
+            f"approval ignored: already claimed key={approval_key} "
+            f"clicker={slack_user_id}"
+        )
+        return
+
+    try:
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text="⏳ Working...",
+            blocks=_working_blocks(str(tool_name), payload_summary),
+        )
+    except SlackApiError as exc:
+        logger.warning(f"approve: working-state chat_update failed: {exc}")
+
+    try:
         result = await dispatch_tool(
             tool_name,
             args,
@@ -265,22 +415,54 @@ async def _handle_approve_click(body, client) -> None:
         logger.exception(f"approve: dispatch_tool({tool_name}) failed")
         result = {"error": str(exc)}
 
+    followup_blocks: list[dict[str, Any]] | None = None
     if isinstance(result, dict) and result.get("ok"):
         msg = result.get("message") or "Done."
+        settled_word = result.get("settled_label") or "Approved"
+        followup_blocks = result.get("blocks")
         text = f"✅ {msg}"
-        blocks = _settled_blocks("✅", f"*Approved.* {msg}")
-        outcome = "approved"
-        summary = msg
+        blocks = _settled_blocks("✅", f"*{settled_word}.* {msg}")
+        outcome = (
+            "approved_alternate"
+            if action.get("action_id") == APPROVE_ALT_ACTION_ID
+            else "approved"
+        )
+        summary = payload_summary or msg
     else:
         err = (
             result.get("error", "Unknown error")
             if isinstance(result, dict)
             else "Unknown error"
         )
-        text = f"⚠️ Failed: {err}"
-        blocks = _settled_blocks("⚠️", f"*Failed.* {err}")
+        safe_err = escape_slack_text(err)
+        text = f"⚠️ Failed: {safe_err}"
+        blocks = _settled_blocks("⚠️", f"*Failed.* {safe_err}")
         outcome = "failed"
-        summary = err
+        summary = safe_err
+    await _mark_approval_status(
+        approval_key,
+        "succeeded" if isinstance(result, dict) and result.get("ok") else "failed",
+        error=None if isinstance(result, dict) and result.get("ok") else summary,
+    )
+
+    # Large read-tool payloads (e.g. the /kpi report) post as their own message
+    # so the card itself stays a compact one-line confirmation.
+    followup_posted = False
+    if followup_blocks:
+        followup_thread_ts = body.get("message", {}).get("thread_ts") or message_ts
+        try:
+            await client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=followup_thread_ts,
+                text=msg,
+                blocks=followup_blocks,
+            )
+            followup_posted = True
+        except SlackApiError as exc:
+            logger.warning(f"approve: follow-up report message failed: {exc}")
+    if followup_blocks and not followup_posted:
+        # The separate message failed — fall back to showing the report inline.
+        blocks = followup_blocks
 
     try:
         await client.chat_update(channel=channel_id, ts=message_ts, text=text, blocks=blocks)
@@ -318,6 +500,52 @@ def register(app) -> None:
         await ack()
         channel_id = body["channel"]["id"]
         message_ts = body["message"]["ts"]
+        slack_user_id = body["user"]["id"]
+        slack_team_id = (
+            body.get("team", {}).get("id")
+            or body.get("user", {}).get("team_id")
+            or ""
+        )
+        approval_key = _approval_key(slack_team_id, channel_id, message_ts)
+        ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
+        if ctx is None:
+            await client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="⚠️ Could not look up your account; please re-run the request.",
+                blocks=_settled_blocks(
+                    "⚠️", "*Failed.* Could not look up your account; please re-run the request."
+                ),
+            )
+            return
+        try:
+            claimed = await _claim_approval(
+                approval_key=approval_key,
+                user_id=ctx["user_id"],
+                slack_team_id=slack_team_id,
+                slack_user_id=slack_user_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                action_id=DISAPPROVE_ACTION_ID,
+                tool_name="cancel",
+            )
+        except IntegrityError as exc:
+            logger.exception(f"approval cancel claim failed: {exc}")
+            await client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="⚠️ Could not claim this approval; please re-run the request.",
+                blocks=_settled_blocks(
+                    "⚠️", "*Failed.* Could not claim this approval; please re-run the request."
+                ),
+            )
+            return
+        if not claimed:
+            logger.info(
+                f"approval cancel ignored: already claimed key={approval_key} "
+                f"clicker={slack_user_id}"
+            )
+            return
         try:
             await client.chat_update(
                 channel=channel_id,
@@ -327,23 +555,16 @@ def register(app) -> None:
             )
         except SlackApiError as exc:
             logger.warning(f"disapprove: chat_update failed: {exc}")
+        await _mark_approval_status(approval_key, "cancelled")
         # Record cancellation into thread history.
-        slack_user_id = body["user"]["id"]
-        slack_team_id = (
-            body.get("team", {}).get("id")
-            or body.get("user", {}).get("team_id")
-            or ""
-        )
         thread_ts = body.get("message", {}).get("thread_ts") or message_ts
         try:
-            ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
-            if ctx is not None:
-                await session_store.append_settled_action(
-                    user_id=ctx["user_id"],
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    outcome="cancelled",
-                    summary="user cancelled the proposed action",
-                )
+            await session_store.append_settled_action(
+                user_id=ctx["user_id"],
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                outcome="cancelled",
+                summary="user cancelled the proposed action",
+            )
         except Exception as exc:
             logger.warning(f"disapprove: history append failed: {exc}")

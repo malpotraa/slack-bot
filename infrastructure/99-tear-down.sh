@@ -4,7 +4,13 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
-source ./_env.sh
+
+ENV_FILE="${ENV_FILE:-./_env.sh}"
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "ERROR: env file not found: ${ENV_FILE}"
+  exit 1
+fi
+source "${ENV_FILE}"
 
 read -r -p "Type the project ID '${PROJECT_ID}' to confirm tear-down: " CONFIRM
 if [[ "${CONFIRM}" != "${PROJECT_ID}" ]]; then

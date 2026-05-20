@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.utils.slack_mrkdwn import escape_slack_text
 from app.utils.timezone import user_tz
 from app.utils.working_hours import TimeSlot
 
@@ -68,7 +69,8 @@ def task_list_blocks(tasks: list[dict]) -> list[dict]:
         perma = t.get("permalink") or ""
         due = (t.get("due_date") or "")
         due_str = f" — _due {due}_" if due else ""
-        link = f"<{perma}|{title}>" if perma else title
+        safe_title = escape_slack_text(title)
+        link = f"<{perma}|{safe_title}>" if perma else safe_title
         lines.append(f"  *{i}.*  {link}{due_str}")
     return _section_chunks("\n".join(lines))
 
@@ -104,7 +106,7 @@ def overlap_warning(
     tz_name: str,
 ) -> list[dict]:
     overlap_lines = "\n".join(
-        f"  • {ov.get('title') or '(untitled)'} "
+        f"  • {escape_slack_text(ov.get('title') or '(untitled)')} "
         f"({_fmt_time(_p(ov['start']), tz_name)}–{_fmt_time(_p(ov['end']), tz_name)})"
         for ov in overlapping[:3]
     )
@@ -134,7 +136,7 @@ def overlap_warning(
 def created_block(*, title: str, start: datetime, end: datetime, tz_name: str, link: str) -> list[dict]:
     return [
         section(
-            f"✅  *Created:* {title}\n"
+            f"✅  *Created:* {escape_slack_text(title)}\n"
             f"_{_fmt_day(start, tz_name)}, {_fmt_time(start, tz_name)}–"
             f"{_fmt_time(end, tz_name)}_\n"
             f"<{link}|Wrike task>"

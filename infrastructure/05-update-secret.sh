@@ -18,4 +18,5 @@ if ! gcloud secrets describe "${NAME}" >/dev/null 2>&1; then
 fi
 printf '%s' "${VALUE}" | gcloud secrets versions add "${NAME}" --data-file=- >/dev/null
 echo "✅ ${NAME} updated. Re-deploy the Cloud Run service to pick up the new value:"
-echo "   gcloud run services update ${SERVICE_NAME} --region=${REGION} --update-secrets=${NAME}=${NAME}:latest"
+echo "   ./infrastructure/04-build-and-deploy.sh --no-build"
+echo "   # or update Cloud Run manually with the app env var mapped to ${NAME}:latest"

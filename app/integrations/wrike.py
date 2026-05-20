@@ -7,14 +7,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from app.db import tokens as token_repo
-from app.db.engine import session_scope
+from app.db.engine import session_factory, session_scope
 from app.db.models import WorkflowStatusCache
 from app.oauth import wrike as wrike_oauth
+from app.oauth._logging import safe_error_summary
+from app.utils.http_client import shared_async_client
 
 
 class WrikeNotConnectedError(RuntimeError):
@@ -78,30 +80,33 @@ class WrikeClient:
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self._auth.base_url}{path}"
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.get(url, headers=self._headers(), params=params)
-            if resp.status_code != 200:
-                logger.error(f"Wrike GET {path} {resp.status_code}: {resp.text}")
-            resp.raise_for_status()
-            return resp.json()
+        resp = await shared_async_client(timeout=30).get(
+            url, headers=self._headers(), params=params
+        )
+        if resp.status_code != 200:
+            logger.error(f"Wrike GET {path} failed: {safe_error_summary(resp)}")
+        resp.raise_for_status()
+        return resp.json()
 
     async def _put(self, path: str, params: dict | None = None) -> dict:
         url = f"{self._auth.base_url}{path}"
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.put(url, headers=self._headers(), params=params)
-            if resp.status_code not in (200, 201):
-                logger.error(f"Wrike PUT {path} {resp.status_code}: {resp.text}")
-            resp.raise_for_status()
-            return resp.json()
+        resp = await shared_async_client(timeout=30).put(
+            url, headers=self._headers(), params=params
+        )
+        if resp.status_code not in (200, 201):
+            logger.error(f"Wrike PUT {path} failed: {safe_error_summary(resp)}")
+        resp.raise_for_status()
+        return resp.json()
 
     async def _post(self, path: str, params: dict | None = None) -> dict:
         url = f"{self._auth.base_url}{path}"
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.post(url, headers=self._headers(), params=params)
-            if resp.status_code not in (200, 201):
-                logger.error(f"Wrike POST {path} {resp.status_code}: {resp.text}")
-            resp.raise_for_status()
-            return resp.json()
+        resp = await shared_async_client(timeout=30).post(
+            url, headers=self._headers(), params=params
+        )
+        if resp.status_code not in (200, 201):
+            logger.error(f"Wrike POST {path} failed: {safe_error_summary(resp)}")
+        resp.raise_for_status()
+        return resp.json()
 
     # ── User identity ──────────────────────────────────────────────────
     async def me(self) -> dict:
@@ -235,7 +240,8 @@ async def resolve_status_ids(user_id: int, status_name: str) -> list[str]:
                 matches.append((cs["id"], wf["id"]))
 
     if matches:
-        async with session_scope() as session:
+        session_maker = session_factory()
+        async with session_maker() as session:
             for sid, wfid in matches:
                 session.add(
                     WorkflowStatusCache(
@@ -244,6 +250,14 @@ async def resolve_status_ids(user_id: int, status_name: str) -> list[str]:
                         custom_status_id=sid,
                         workflow_id=wfid,
                     )
+                )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                logger.info(
+                    f"Wrike status cache warmed concurrently for user {user_id}, "
+                    f"status {status_name!r}"
                 )
         logger.info(
             f"Wrike status {status_name!r} resolved to {len(matches)} IDs for user {user_id}"

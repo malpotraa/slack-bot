@@ -30,6 +30,44 @@ _BOLD_RE = re.compile(r"\*\*([^\n*][^*]*?)\*\*")  # **bold**
 _LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")  # [text](url)
 _BULLET_RE = re.compile(r"^[ \t]*[-*]\s+", re.MULTILINE)
 
+_SLACK_USER_WITH_LABEL_RE = re.compile(r"<@([A-Z0-9]+)\|([^>]+)>")
+_SLACK_USER_RE = re.compile(r"<@([A-Z0-9]+)>")
+_SLACK_CHANNEL_WITH_LABEL_RE = re.compile(r"<#([A-Z0-9]+)\|([^>]+)>")
+_SLACK_CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)>")
+_SLACK_SPECIAL_WITH_LABEL_RE = re.compile(r"<!(?:subteam\^[A-Z0-9]+|[^>|]+)\|([^>]+)>")
+_SLACK_SPECIAL_RE = re.compile(r"<!(channel|here|everyone)>")
+_SLACK_LINK_WITH_LABEL_RE = re.compile(r"<(https?://[^>|]+)\|([^>]+)>")
+_SLACK_BARE_LINK_RE = re.compile(r"<(https?://[^>]+)>")
+
+
+def escape_slack_text(text: object) -> str:
+    """Escape user/provider text before embedding it in Slack mrkdwn."""
+    if text is None:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def slack_markup_to_text(text: object) -> str:
+    """Convert Slack's internal markup tokens into readable plain text."""
+    if text is None:
+        return ""
+    body = str(text)
+    body = _SLACK_LINK_WITH_LABEL_RE.sub(lambda m: m.group(2), body)
+    body = _SLACK_BARE_LINK_RE.sub(lambda m: m.group(1), body)
+    body = _SLACK_USER_WITH_LABEL_RE.sub(lambda m: f"@{m.group(2)}", body)
+    body = _SLACK_USER_RE.sub(lambda m: f"@{m.group(1)}", body)
+    body = _SLACK_CHANNEL_WITH_LABEL_RE.sub(lambda m: f"#{m.group(2)}", body)
+    body = _SLACK_CHANNEL_RE.sub(lambda m: f"#{m.group(1)}", body)
+    body = _SLACK_SPECIAL_WITH_LABEL_RE.sub(lambda m: m.group(1), body)
+    body = _SLACK_SPECIAL_RE.sub(lambda m: f"@{m.group(1)}", body)
+    return body
+
+
+def quote_slack_text(text: object) -> str:
+    """Render untrusted text as a Slack quote without allowing control syntax."""
+    escaped = escape_slack_text(text)
+    return "\n".join(f"> {line}" for line in escaped.splitlines()) or ">"
+
 
 def _protect(text: str) -> tuple[str, list[str]]:
     """Replace code regions with placeholders so we don't transform inside them."""

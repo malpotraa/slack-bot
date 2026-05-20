@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-import httpx
 from loguru import logger
 
 from app.config import settings
+from app.utils.http_client import shared_async_client
 
 AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
 TOKEN_URL = "https://slack.com/api/oauth.v2.access"
@@ -39,19 +39,19 @@ def authorize_url(state: str) -> str:
 
 
 async def exchange_code(code: str) -> dict:
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            TOKEN_URL,
-            data={
-                "client_id": settings.slack_client_id,
-                "client_secret": settings.slack_client_secret,
-                "code": code,
-                "redirect_uri": settings.slack_user_redirect_uri,
-            },
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        if not body.get("ok"):
-            logger.error(f"Slack OAuth exchange not ok: {body}")
-            raise RuntimeError(f"Slack OAuth failed: {body.get('error', 'unknown')}")
-        return body
+    resp = await shared_async_client(timeout=20).post(
+        TOKEN_URL,
+        data={
+            "client_id": settings.slack_client_id,
+            "client_secret": settings.slack_client_secret,
+            "code": code,
+            "redirect_uri": settings.slack_user_redirect_uri,
+        },
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("ok"):
+        err = body.get("error", "unknown")
+        logger.error(f"Slack OAuth exchange not ok: error={err!r}")
+        raise RuntimeError(f"Slack OAuth failed: {err}")
+    return body

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,6 +12,17 @@ from sqlmodel import select
 
 from app.db.engine import session_scope
 from app.db.models import ConversationSession
+
+_HISTORY_LOCKS: dict[tuple[int, str, str], asyncio.Lock] = {}
+
+
+def _history_lock(user_id: int, channel_id: str, thread_ts: str) -> asyncio.Lock:
+    key = (user_id, channel_id, thread_ts)
+    lock = _HISTORY_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _HISTORY_LOCKS[key] = lock
+    return lock
 
 
 async def _find(
@@ -105,6 +117,28 @@ async def append_agent_turn(
     summarize_when_more_than: int = 12,
 ) -> None:
     """Append (user, assistant) and roll older history into a summary if it gets long."""
+    async with _history_lock(user_id, channel_id, thread_ts):
+        await _append_agent_turn_locked(
+            user_id=user_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            user_msg=user_msg,
+            assistant_msg=assistant_msg,
+            keep_recent_turns=keep_recent_turns,
+            summarize_when_more_than=summarize_when_more_than,
+        )
+
+
+async def _append_agent_turn_locked(
+    *,
+    user_id: int,
+    channel_id: str,
+    thread_ts: str,
+    user_msg: str,
+    assistant_msg: str,
+    keep_recent_turns: int,
+    summarize_when_more_than: int,
+) -> None:
     async with session_scope() as session:
         row = await _find(session, user_id=user_id, channel_id=channel_id, thread_ts=thread_ts)
         history: list[dict] = []
@@ -164,6 +198,24 @@ async def append_settled_action(
     summary: short human-readable description of what settled (the same text
         used in the card body).
     """
+    async with _history_lock(user_id, channel_id, thread_ts):
+        await _append_settled_action_locked(
+            user_id=user_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            outcome=outcome,
+            summary=summary,
+        )
+
+
+async def _append_settled_action_locked(
+    *,
+    user_id: int,
+    channel_id: str,
+    thread_ts: str,
+    outcome: str,
+    summary: str,
+) -> None:
     async with session_scope() as session:
         row = await _find(
             session, user_id=user_id, channel_id=channel_id, thread_ts=thread_ts

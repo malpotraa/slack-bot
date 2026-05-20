@@ -19,6 +19,7 @@ from openinference.semconv.trace import OpenInferenceSpanKindValues as Kind
 from openinference.semconv.trace import SpanAttributes
 
 from app.observability import start_span
+from app.slack_app import connect_prompt
 from app.slack_app.connection_status import status_for
 from app.utils.timezone import end_of_day, now_in, start_of_day
 from app.utils.working_hours import (
@@ -118,6 +119,7 @@ async def _fetch_calendar(*, user_id: int, tz_name: str, workday_start: str, wor
                     "start": ev.get("start", {}).get("dateTime")
                     or ev.get("start", {}).get("date"),
                     "end": ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date"),
+                    "is_all_day": gcal.event_is_all_day(ev),
                     "category": gcal.classify_event(ev),
                 }
             )
@@ -172,7 +174,7 @@ def register(app):
             await client.chat_postEphemeral(
                 channel=body["channel_id"],
                 user=slack_user_id,
-                text="📬 Building your briefing in our DM…",
+                text="📬 I sent you a DM.",
             )
 
         # Post a temporary loading message in the DM. We'll replace it via chat_update
@@ -185,19 +187,19 @@ def register(app):
 
         try:
             status = await status_for(slack_team_id, slack_user_id)
-            missing = []
+            missing_providers: list[str] = []
             if not status.google:
-                missing.append("Google Calendar")
+                missing_providers.append("google")
             if not status.wrike:
-                missing.append("Wrike")
+                missing_providers.append("wrike")
             if not status.slack_user_token:
-                missing.append("Slack search")
+                missing_providers.append("slack_user")
 
             with start_span("command.goodmorning", kind=Kind.CHAIN) as span:
                 # Rich attributes for Phoenix
                 span.set_attribute("user.id", slack_user_id)
                 span.set_attribute("user.name", real_name or "")
-                if email:
+                if email and settings.trace_sensitive_data:
                     span.set_attribute("user.email", email)
                 span.set_attribute("user.slack_id", slack_user_id)
                 span.set_attribute("user.db_id", str(user_id))
@@ -239,19 +241,33 @@ def register(app):
                 free_slots=free_slots,
             )
 
-            if missing:
+            if missing_providers:
+                labels = ", ".join(
+                    f"*{connect_prompt.provider_label(p)}*" for p in missing_providers
+                )
+                blocks.append({"type": "divider"})
                 blocks.append(
                     {
-                        "type": "context",
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"⚠️ Not yet connected: {labels}. "
+                                "Connect to unlock the full briefing:"
+                            ),
+                        },
+                    }
+                )
+                blocks.append(
+                    {
+                        "type": "actions",
                         "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": (
-                                    "⚠️ Not yet connected: "
-                                    + ", ".join(f"*{m}*" for m in missing)
-                                    + " — run `/connect` to fix."
-                                ),
-                            }
+                            connect_prompt.connect_button(
+                                p,
+                                slack_team_id=slack_team_id,
+                                slack_user_id=slack_user_id,
+                            )
+                            for p in missing_providers
                         ],
                     }
                 )

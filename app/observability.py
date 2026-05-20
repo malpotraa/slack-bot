@@ -61,7 +61,10 @@ def configure_observability() -> None:
     try:
         from openinference.instrumentation.anthropic import AnthropicInstrumentor
 
-        AnthropicInstrumentor().instrument(tracer_provider=tracer_provider)
+        if settings.trace_sensitive_data:
+            AnthropicInstrumentor().instrument(tracer_provider=tracer_provider)
+        else:
+            logger.info("Anthropic auto-instrumentation skipped; TRACE_SENSITIVE_DATA=false")
     except Exception as exc:  # pragma: no cover
         logger.warning(f"Anthropic instrumentation skipped: {exc}")
 

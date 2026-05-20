@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.integrations.slack_search import UnrepliedMention
+from app.utils.slack_mrkdwn import escape_slack_text, slack_markup_to_text
 from app.utils.timezone import user_tz
 from app.utils.working_hours import TimeSlot
 
@@ -66,17 +67,18 @@ def _section_chunks(text: str) -> list[dict]:
 def _channel_label(m: UnrepliedMention) -> str:
     if m.is_dm:
         return "in DM"
-    return f"in #{m.channel_name}" if m.channel_name else ""
+    return f"in #{escape_slack_text(m.channel_name)}" if m.channel_name else ""
 
 
 def _mention_line(m: UnrepliedMention, tz_name: str) -> str:
     when = _fmt_time(m.posted_at, tz_name)
-    snippet = (m.text or "").replace("\n", " ")
+    snippet = slack_markup_to_text(m.text).replace("\n", " ")
     if len(snippet) > 80:
         snippet = snippet[:77] + "…"
+    snippet = escape_slack_text(snippet)
     chan = _channel_label(m)
     link = f"<{m.permalink}|{when}>" if m.permalink else when
-    author = f"*{m.author_name}*" if m.author_name else "(unknown)"
+    author = f"*{escape_slack_text(m.author_name)}*" if m.author_name else "(unknown)"
     return f"• {author} {chan} @ {link} — {snippet}"
 
 
@@ -93,7 +95,8 @@ def _wrike_line(task: dict) -> str:
     title = task.get("title") or "(untitled)"
     perma = task.get("permalink") or ""
     due = _fmt_due(task.get("due_date"))
-    return f"• <{perma}|{title}>  ·  {due}" if perma else f"• {title}  ·  {due}"
+    safe_title = escape_slack_text(title)
+    return f"• <{perma}|{safe_title}>  ·  {due}" if perma else f"• {safe_title}  ·  {due}"
 
 
 def _hms(td: timedelta) -> str:
@@ -120,7 +123,9 @@ def briefing_blocks(
     free_slots: list[TimeSlot],
 ) -> list[dict]:
     blocks: list[dict] = [
-        _slack_section(f"🌅  *Good morning, {user_name}* — {_fmt_day(today, tz_name)}"),
+        _slack_section(
+            f"🌅  *Good morning, {escape_slack_text(user_name)}* — {_fmt_day(today, tz_name)}"
+        ),
         {"type": "divider"},
     ]
 
@@ -168,16 +173,18 @@ def briefing_blocks(
         for ev in calendar_events:
             start = ev.get("start") or ""
             end = ev.get("end") or ""
-            try:
-                s = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                ts_label = f"{_fmt_time(s, tz_name)}–{_fmt_time(e, tz_name)}"
-            except Exception:
+            if ev.get("is_all_day"):
                 ts_label = "all day"
-            tag = ""
-            if ev.get("category") == "blocked":
-                tag = "  *[BLOCKED]*"
-            cal_lines.append(f"• {ts_label}  {ev.get('title') or '(untitled)'}{tag}")
+            else:
+                try:
+                    s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                    ts_label = f"{_fmt_time(s, tz_name)}–{_fmt_time(e, tz_name)}"
+                except Exception:
+                    ts_label = "time unknown"
+            cal_lines.append(
+                f"• {ts_label}  {escape_slack_text(ev.get('title') or '(untitled)')}"
+            )
         if free_slots:
             first = free_slots[0]
             cal_lines.append(
@@ -192,7 +199,10 @@ def briefing_blocks(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"_Generated at {_fmt_time(today, tz_name)}_  ·  Run `/connect` to manage integrations",
+                    "text": (
+                        f"_Generated at {_fmt_time(today, tz_name)}_  ·  "
+                        "Ask me here to move a meeting or plan your next open block."
+                    ),
                 }
             ],
         }

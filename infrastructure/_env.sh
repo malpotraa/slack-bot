@@ -6,14 +6,14 @@
 set -euo pipefail
 
 # ─── Required ────────────────────────────────────────────────────────────
-export PROJECT_ID="${PROJECT_ID:-CHANGE-ME}"        # e.g. "my-slack-assistant"
+export PROJECT_ID="${PROJECT_ID:-slack-marketing-bot}"        # e.g. "my-slack-assistant"
 export REGION="${REGION:-us-central1}"
-export SERVICE_NAME="${SERVICE_NAME:-slack-assistant}"
+export SERVICE_NAME="${SERVICE_NAME:-pronto}"
 
 # ─── Cloud SQL ───────────────────────────────────────────────────────────
 export SQL_INSTANCE="${SQL_INSTANCE:-${SERVICE_NAME}-pg}"
-export SQL_DB_NAME="${SQL_DB_NAME:-slack_assistant}"
-export SQL_DB_USER="${SQL_DB_USER:-app}"
+export SQL_DB_NAME="${SQL_DB_NAME:-pronto}"
+export SQL_DB_USER="${SQL_DB_USER:-pronto_app}"
 export SQL_TIER="${SQL_TIER:-db-f1-micro}"
 export SQL_DISK_GB="${SQL_DISK_GB:-10}"
 # DB password — generated automatically on first run if blank

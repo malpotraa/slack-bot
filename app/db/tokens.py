@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.db.crypto import cipher
-from app.db.models import GoogleToken, SlackUserToken, WrikeToken
+from app.db.models import GoogleAdsToken, GoogleToken, SlackUserToken, WrikeToken
 
 # ── Google ─────────────────────────────────────────────────────────────────
 
@@ -65,6 +65,69 @@ async def get_google_token(session: AsyncSession, user_id: int) -> GoogleToken |
 
 
 def decrypt_google(token: GoogleToken) -> tuple[str, str | None]:
+    c = cipher()
+    refresh = c.decrypt(token.encrypted_refresh_token)
+    access = c.decrypt(token.encrypted_access_token) if token.encrypted_access_token else None
+    return refresh, access
+
+
+# ── Google Ads ─────────────────────────────────────────────────────────────
+
+
+async def upsert_google_ads_token(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    refresh_token: str | None,
+    access_token: str | None,
+    access_token_expires_at: datetime | None,
+    scopes: str,
+    google_email: str | None,
+) -> GoogleAdsToken:
+    existing = (
+        await session.exec(select(GoogleAdsToken).where(GoogleAdsToken.user_id == user_id))
+    ).first()
+    c = cipher()
+    now = datetime.now(UTC)
+
+    if existing is None:
+        if not refresh_token:
+            raise ValueError("First-time Google Ads connect requires a refresh_token")
+        existing = GoogleAdsToken(
+            user_id=user_id,
+            encrypted_refresh_token=c.encrypt(refresh_token),
+            encrypted_access_token=c.encrypt(access_token) if access_token else None,
+            access_token_expires_at=access_token_expires_at,
+            scopes=scopes,
+            google_email=google_email,
+        )
+        session.add(existing)
+        return existing
+
+    if refresh_token:
+        existing.encrypted_refresh_token = c.encrypt(refresh_token)
+    if access_token:
+        existing.encrypted_access_token = c.encrypt(access_token)
+    if access_token_expires_at:
+        existing.access_token_expires_at = access_token_expires_at
+    if scopes:
+        existing.scopes = scopes
+    if google_email:
+        existing.google_email = google_email
+    existing.updated_at = now
+    session.add(existing)
+    return existing
+
+
+async def get_google_ads_token(
+    session: AsyncSession, user_id: int
+) -> GoogleAdsToken | None:
+    return (
+        await session.exec(select(GoogleAdsToken).where(GoogleAdsToken.user_id == user_id))
+    ).first()
+
+
+def decrypt_google_ads(token: GoogleAdsToken) -> tuple[str, str | None]:
     c = cipher()
     refresh = c.decrypt(token.encrypted_refresh_token)
     access = c.decrypt(token.encrypted_access_token) if token.encrypted_access_token else None

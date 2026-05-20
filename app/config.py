@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     # ── Google ──
     google_client_id: str = ""
     google_client_secret: str = ""
+    google_ads_developer_token: str = ""
+    google_ads_login_customer_id: str = ""
+    google_ads_api_version: str = "v22"
 
     # ── Wrike ──
     wrike_client_id: str = ""
@@ -63,6 +66,7 @@ class Settings(BaseSettings):
     phoenix_collector_endpoint: str = "https://app.phoenix.arize.com"
     phoenix_project_name: str = "slack-assistant"
     phoenix_api_key: str = ""
+    trace_sensitive_data: bool = False
 
     # ── Defaults ──
     default_workday_start: str = "09:00"
@@ -71,6 +75,10 @@ class Settings(BaseSettings):
     @property
     def google_redirect_uri(self) -> str:
         return f"{self.app_base_url}/oauth/google/callback"
+
+    @property
+    def google_ads_redirect_uri(self) -> str:
+        return f"{self.app_base_url}/oauth/google-ads/callback"
 
     @property
     def wrike_redirect_uri(self) -> str:

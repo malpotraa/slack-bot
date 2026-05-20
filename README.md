@@ -1,13 +1,13 @@
-# Slack Assistant
+# Pronto
 
-> Multi-user Slack-native AI assistant for Google Calendar, Wrike, and Slack — built on Claude (Anthropic), deployed on Google Cloud Run, observable through Arize Phoenix.
+> Multi-user Slack-native AI assistant for Google Calendar, Google Ads, Wrike, and Slack — built on Claude (Anthropic), deployed on Google Cloud Run, observable through Arize Phoenix.
 
 [![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Runtime](https://img.shields.io/badge/runtime-Cloud%20Run-4285F4.svg)](https://cloud.google.com/run)
 [![LLM](https://img.shields.io/badge/LLM-Claude%20Sonnet%204.6-D97757.svg)](https://www.anthropic.com/claude)
 [![License](https://img.shields.io/badge/license-Proprietary-lightgrey.svg)](#license)
 
-Talk to it in a Slack DM. It reads your calendar, your Wrike tasks, and your unreplied @-mentions, and helps you act on them — with explicit approval before any write.
+Talk to it in a Slack DM. It reads your calendar, Google Ads KPIs, Wrike tasks, and unreplied @-mentions, and helps you act on them — with explicit approval before any write or sensitive KPI pull.
 
 ---
 
@@ -38,9 +38,10 @@ Talk to it in a Slack DM. It reads your calendar, your Wrike tasks, and your unr
 | Capability | Description |
 |---|---|
 | **Conversational agent** | Free-form chat in the bot's DM. Replies stream token-by-token (perceived TTFT ~1–2s). Threaded conversation memory with auto-summarization. |
-| **`/connect`** | One-command OAuth flow for Google Calendar, Wrike, and Slack search. Card auto-cleans up after all three are linked. |
+| **`/connect`** | One-command OAuth flow for Google Calendar, Google Ads, Wrike, and Slack search. Card auto-cleans up after all integrations are linked. |
 | **`/goodmorning`** | Daily briefing: unreplied @-mentions (last 7 days), Wrike "New" tasks, today's calendar with busy/free summary. |
 | **`/wrike`** | Schedule Wrike "New" tasks onto your calendar via a multi-turn natural-language flow with overlap detection. |
+| **`/kpi google <account> [cpa\|roas]`** | Google Ads KPI report for one account under the configured MCC, with approval before pulling campaign and keyword-driver data. |
 | **Approval-gated writes** | Every write (create/update calendar event, change Wrike status, post Wrike comment) is two-phase: preview → user confirms → execute. |
 | **Restricted scope** | Hard boundaries enforced in code + system prompt. No deletes on Calendar. No task creates/deletes on Wrike. Slack is read-only. |
 | **Phoenix tracing** | Every conversation, tool call, and result captured as an OpenTelemetry trace with user attribution. |
@@ -51,6 +52,7 @@ Talk to it in a Slack DM. It reads your calendar, your Wrike tasks, and your unr
                               ┌─────────────────────┐
 Slack workspace ──Socket Mode►│ Cloud Run service   │──► Anthropic API
                               │  Bolt + FastAPI     │──► Google Calendar API
+                              │                     │──► Google Ads API
 User browsers ─OAuth callback►│  in one container   │──► Wrike API
                               └──────────┬──────────┘
                                          │
@@ -72,7 +74,7 @@ User browsers ─OAuth callback►│  in one container   │──► Wrike API
 - **Single container, two services.** Slack Bolt (Socket Mode WebSocket) and FastAPI (OAuth callbacks) share one asyncio event loop. No reverse proxy needed.
 - **Always-on CPU + `min=max=1` Cloud Run instance.** Required for Socket Mode reliability — see [Operations runbook](#operations-runbook).
 - **Tokens encrypted at rest** with Fernet keys stored in Secret Manager. Database itself has no plaintext OAuth tokens.
-- **Commands are deterministic, not agentic.** `/goodmorning` and `/wrike` are hand-coded flows that call the LLM only for entity extraction. The free-form conversational agent (DM chat) has the LLM in the loop with a restricted tool surface.
+- **Commands are deterministic first.** `/goodmorning`, `/wrike`, and `/kpi` use hand-coded data pulls and math. `/kpi` lets the agent write short explanations only from a bounded fact pack; it never calculates ad spend metrics.
 
 ## Tech stack
 
@@ -104,9 +106,9 @@ prod/
 │   ├── db/                           # SQLModel tables, token crypto (Fernet), engine
 │   ├── oauth/                        # Google / Wrike / Slack OAuth flows + FastAPI callbacks
 │   ├── slack_app/                    # Bolt app factory + slash commands + event handlers
-│   │   └── commands/                 #   /connect, /goodmorning, /wrike
+│   │   └── commands/                 #   /connect, /goodmorning, /kpi, /wrike
 │   ├── agent/                        # Conversational agent: runner, tools, prompts
-│   ├── integrations/                 # Per-user clients: Google Calendar, Wrike REST, Slack search
+│   ├── integrations/                 # Per-user clients: Google Calendar/Ads, Wrike REST, Slack search
 │   ├── llm/                          # Structured extraction (slot-filling for /wrike)
 │   ├── sessions/                     # Per-thread session store (Postgres)
 │   ├── formatters/                   # Block Kit builders
@@ -221,8 +223,9 @@ https://<your-cloud-run-url>/oauth/{slack|google|wrike}/callback
 In Slack, in the bot's DM:
 
 ```
-/connect     ← runs first; click each of the 3 OAuth buttons
+/connect     ← runs first; click each OAuth button
 /goodmorning ← briefing arrives in DM
+/kpi google jump cpa
 /wrike       ← list of "New" tasks with available time slots
 ```
 
@@ -248,11 +251,15 @@ All runtime configuration is environment-driven. Cloud Run injects values from S
 | `SLACK_CLIENT_SECRET` | ✓ | From Slack Basic Information |
 | `GOOGLE_CLIENT_ID` | ✓ | From Google Cloud Credentials → OAuth client |
 | `GOOGLE_CLIENT_SECRET` | ✓ | From Google Cloud Credentials → OAuth client |
+| `GOOGLE_ADS_DEVELOPER_TOKEN` | ✓ for `/kpi` | From Google Ads API Center |
+| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | ✓ for `/kpi` | MCC customer ID used as the only account search root |
+| `GOOGLE_ADS_API_VERSION` | — | Default `v22` |
 | `WRIKE_CLIENT_ID` | ✓ | From wrike.com/frame/oauth2/apps |
 | `WRIKE_CLIENT_SECRET` | ✓ | From wrike.com/frame/oauth2/apps |
 | `PHOENIX_COLLECTOR_ENDPOINT` | — | `https://app.phoenix.arize.com/s/<space>` for Phoenix Cloud |
 | `PHOENIX_API_KEY` | — | Empty for self-host; set for Phoenix Cloud |
 | `PHOENIX_PROJECT_NAME` | — | Default `slack-assistant` |
+| `TRACE_SENSITIVE_DATA` | — | Default `false`; set `true` only for approved tracing sinks |
 | `APP_ENV` | — | `prod` |
 | `LOG_LEVEL` | — | `INFO` |
 
@@ -260,8 +267,9 @@ All runtime configuration is environment-driven. Cloud Run injects values from S
 
 | Command | Behavior |
 |---|---|
-| `/connect` | DMs you OAuth buttons for Google, Wrike, Slack search. Auto-cleans up the card 20s after all three are linked. |
+| `/connect` | DMs you OAuth buttons for Google Calendar, Google Ads, Wrike, Slack search. Auto-cleans up the card 20s after all integrations are linked. |
 | `/goodmorning` | Daily briefing: unreplied @-mentions (last 7d, with your own bot messages filtered out), Wrike "New" tasks + due-in-48h, today's calendar with busy/free totals. |
+| `/kpi google <account> [cpa\|roas]` | Finds enabled accounts under the configured MCC whose name contains `<account>`, asks for disambiguation if needed, shows date ranges and scope, then pulls the KPI report after approval. |
 | `/wrike` | Lists Wrike "New" tasks + open calendar slots. Reply in-thread with `"schedule #2 tomorrow 10–11"` (natural language). Bot extracts intent, previews the event, and creates it on approval with overlap detection. |
 
 ## Agent capabilities & scope

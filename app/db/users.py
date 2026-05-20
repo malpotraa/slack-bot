@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -25,16 +26,22 @@ async def get_or_create_user(
     )
     user = (await session.exec(stmt)).first()
     if user is None:
-        user = User(
-            slack_team_id=slack_team_id,
-            slack_user_id=slack_user_id,
-            email=email,
-            real_name=real_name,
-            tz=tz,
-        )
-        session.add(user)
-        await session.flush()
-        return user
+        try:
+            async with session.begin_nested():
+                user = User(
+                    slack_team_id=slack_team_id,
+                    slack_user_id=slack_user_id,
+                    email=email,
+                    real_name=real_name,
+                    tz=tz,
+                )
+                session.add(user)
+                await session.flush()
+            return user
+        except IntegrityError:
+            user = (await session.exec(stmt)).first()
+            if user is None:
+                raise
 
     changed = False
     if email and user.email != email:

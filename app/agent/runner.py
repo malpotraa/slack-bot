@@ -15,6 +15,7 @@ Phoenix tracing remains rich: per-turn span, per-tool span, full input/output.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -32,6 +33,8 @@ from app.observability import start_span
 from app.utils.timezone import fmt_local_range, now_in
 
 _anthropic: AsyncAnthropic | None = None
+_PREFETCH_TTL_SECONDS = 180
+_PREFETCH_CACHE: dict[tuple[int, str, str], tuple[float, str | None]] = {}
 
 
 def _client() -> AsyncAnthropic:
@@ -69,7 +72,7 @@ def _set_session_attrs(
 ) -> None:
     span.set_attribute("user.id", slack_user_id or str(user_id))
     span.set_attribute("user.name", user_name or "")
-    if user_email:
+    if user_email and settings.trace_sensitive_data:
         span.set_attribute("user.email", user_email)
     span.set_attribute("user.slack_id", slack_user_id)
     span.set_attribute("user.db_id", str(user_id))
@@ -79,11 +82,20 @@ def _set_session_attrs(
     span.set_attribute("slack.thread_ts", thread_ts)
 
 
+def _trace_payload(value: str, *, redacted: str = "[redacted]") -> str:
+    return value if settings.trace_sensitive_data else redacted
+
+
 StreamCallback = Callable[[str], Awaitable[None]]
 
 
 async def _prefetch_upcoming_events_context(
-    user_id: int, tz_name: str, *, max_events: int = 8
+    user_id: int,
+    tz_name: str,
+    *,
+    channel_id: str = "",
+    thread_ts: str = "",
+    max_events: int = 8,
 ) -> str | None:
     """Best-effort: fetch the next ~8 hours of events and return a compact
     context string the LLM can use to answer "what's next?" without a tool
@@ -91,12 +103,19 @@ async def _prefetch_upcoming_events_context(
     """
     from datetime import timedelta
 
+    cache_key = (user_id, channel_id, thread_ts)
+    cached = _PREFETCH_CACHE.get(cache_key)
+    now_mono = time.monotonic()
+    if cached and now_mono - cached[0] < _PREFETCH_TTL_SECONDS:
+        return cached[1]
+
     try:
         now = now_in(tz_name)
         events = await gcal.list_events(
             user_id, time_min=now, time_max=now + timedelta(hours=8)
         )
     except Exception:
+        _PREFETCH_CACHE[cache_key] = (now_mono, None)
         return None
 
     lines: list[str] = []
@@ -113,12 +132,15 @@ async def _prefetch_upcoming_events_context(
             break
 
     if not lines:
+        _PREFETCH_CACHE[cache_key] = (now_mono, None)
         return None
-    return (
+    result = (
         "[Upcoming events (next 8h, may be stale by a few minutes):\n"
         + "\n".join(lines)
         + "\nUse list_calendar_events for longer ranges or precise lookups.]"
     )
+    _PREFETCH_CACHE[cache_key] = (now_mono, result)
+    return result
 
 
 def _clean_assistant_block(bd: dict[str, Any]) -> dict[str, Any]:
@@ -215,12 +237,13 @@ async def run_agent_turn(
         )
     if extra_system_context:
         system_blocks.append({"type": "text", "text": extra_system_context})
-    else:
+    elif not history:
         # Only pre-fetch upcoming events for general DM turns (not /wrike
-        # threads, where the dynamic context is already meaningful and we
-        # don't want to add latency). Failures are silent — the model can
-        # still call list_calendar_events itself.
-        upcoming = await _prefetch_upcoming_events_context(user_id, user_tz)
+        # threads, or established threads where the user intent is usually
+        # clear enough and the model can call Calendar if needed).
+        upcoming = await _prefetch_upcoming_events_context(
+            user_id, user_tz, channel_id=channel_id, thread_ts=thread_ts
+        )
         if upcoming:
             system_blocks.append({"type": "text", "text": upcoming})
     tools = _tools_with_caching()
@@ -240,7 +263,7 @@ async def run_agent_turn(
             channel_id=channel_id,
             thread_ts=thread_ts,
         )
-        span.set_attribute(SpanAttributes.INPUT_VALUE, user_message)
+        span.set_attribute(SpanAttributes.INPUT_VALUE, _trace_payload(user_message))
         span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
         span.set_attribute("agent.model", settings.agent_model)
         span.set_attribute("agent.prompt_version", PROMPT_VERSION)
@@ -313,7 +336,10 @@ async def run_agent_turn(
 
             if final.stop_reason != "tool_use" or not tool_uses:
                 final_text = "\n".join(p for p in text_parts if p).strip()
-                span.set_attribute(SpanAttributes.OUTPUT_VALUE, final_text or "(empty)")
+                span.set_attribute(
+                    SpanAttributes.OUTPUT_VALUE,
+                    _trace_payload(final_text or "(empty)"),
+                )
                 span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "text/plain")
                 span.set_attribute("agent.iterations", iteration + 1)
                 span.set_attribute("agent.tools_used", json.dumps(tools_used))
@@ -336,12 +362,13 @@ async def run_agent_turn(
                 tool_input = tu.get("input", {})
                 tools_used.append(tool_name)
                 tool_input_json = json.dumps(tool_input)[:8000]
+                traced_tool_input = _trace_payload(tool_input_json)
                 with start_span(
                     f"tool.{tool_name}",
                     kind=Kind.TOOL,
                     attributes={
                         SpanAttributes.TOOL_NAME: tool_name,
-                        SpanAttributes.INPUT_VALUE: tool_input_json,
+                        SpanAttributes.INPUT_VALUE: traced_tool_input,
                         SpanAttributes.INPUT_MIME_TYPE: "application/json",
                     },
                 ) as ts:
@@ -355,7 +382,7 @@ async def run_agent_turn(
                         channel_id=channel_id,
                         thread_ts=thread_ts,
                     )
-                    ts.set_attribute("tool.input", tool_input_json)
+                    ts.set_attribute("tool.input", traced_tool_input)
                     is_error = False
                     try:
                         result = await dispatch_tool(
@@ -374,8 +401,9 @@ async def run_agent_turn(
                         ts.set_status(trace.StatusCode.ERROR, str(exc))
                         is_error = True
                     tool_output_json = json.dumps(result, default=str)[:8000]
-                    ts.set_attribute("tool.output", tool_output_json)
-                    ts.set_attribute(SpanAttributes.OUTPUT_VALUE, tool_output_json)
+                    traced_tool_output = _trace_payload(tool_output_json)
+                    ts.set_attribute("tool.output", traced_tool_output)
+                    ts.set_attribute(SpanAttributes.OUTPUT_VALUE, traced_tool_output)
                     ts.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "application/json")
                     if isinstance(result, dict) and result.get("preview"):
                         ts.set_attribute("tool.is_preview", True)

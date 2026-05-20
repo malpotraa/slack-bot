@@ -13,11 +13,17 @@ from app.db.users import get_user_by_slack_id
 class ConnectionStatus:
     user_id: int | None
     google: bool
+    google_ads: bool
     wrike: bool
     slack_user_token: bool
 
     @property
     def all_connected(self) -> bool:
+        return self.google and self.google_ads and self.wrike and self.slack_user_token
+
+    @property
+    def core_connected(self) -> bool:
+        """Integrations needed for the assistant's baseline daily workflow."""
         return self.google and self.wrike and self.slack_user_token
 
 
@@ -25,13 +31,15 @@ async def status_for(slack_team_id: str, slack_user_id: str) -> ConnectionStatus
     async with session_scope() as session:
         user = await get_user_by_slack_id(session, slack_team_id, slack_user_id)
         if user is None or user.id is None:
-            return ConnectionStatus(None, False, False, False)
+            return ConnectionStatus(None, False, False, False, False)
         google = await token_repo.get_google_token(session, user.id)
+        google_ads = await token_repo.get_google_ads_token(session, user.id)
         wrike = await token_repo.get_wrike_token(session, user.id)
         slack_tok = await token_repo.get_slack_user_token(session, user.id)
     return ConnectionStatus(
         user_id=user.id,
         google=google is not None,
+        google_ads=google_ads is not None,
         wrike=wrike is not None,
         slack_user_token=slack_tok is not None,
     )

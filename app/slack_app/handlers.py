@@ -90,10 +90,27 @@ class SlackStreamUpdater:
 
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
 def _strip_mentions(text: str) -> str:
     return _MENTION_RE.sub("", text or "").strip()
+
+
+def _create_background_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _BACKGROUND_TASKS.discard(done)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(f"Slack background task failed: {exc}")
+
+    task.add_done_callback(_done)
 
 
 def _approval_button_labels(action: dict) -> tuple[str, str]:
@@ -120,7 +137,15 @@ def _approval_button_labels(action: dict) -> tuple[str, str]:
     if tool == "create_calendar_event":
         return "✅ Create", alt_label
     if tool == "update_calendar_event":
-        return "✅ Move", alt_label
+        args = action.get("args") or {}
+        time_changed = bool(args.get("start_iso") or args.get("end_iso"))
+        title_changed = bool(args.get("title"))
+        description_changed = args.get("description") is not None
+        if time_changed and not title_changed and not description_changed:
+            return "✅ Move", alt_label
+        if title_changed and not time_changed and not description_changed:
+            return "✅ Rename", alt_label
+        return "✅ Update", alt_label
     if tool == "schedule_wrike_task":
         return "✅ Schedule", alt_label
     if tool == "post_wrike_task_comment":
@@ -157,17 +182,37 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
         f"text={text[:60]!r}"
     )
 
-    # Resolve / upsert the User row up front.
+    # Hydrate user profile (timezone, name, email) before the single user upsert.
+    try:
+        user_info_resp = await client.users_info(user=slack_user_id)
+        u = user_info_resp.get("user", {}) or {}
+        profile = u.get("profile", {}) or {}
+        tz = u.get("tz") or "UTC"
+        email = profile.get("email")
+        real_name = u.get("real_name") or profile.get("real_name") or u.get("name")
+    except Exception as exc:
+        logger.warning(f"users_info failed: {exc}")
+        tz = "UTC"
+        email = None
+        real_name = None
+
+    # Resolve / upsert the User row once.
     async with session_scope() as session:
         user = await get_or_create_user(
             session,
             slack_team_id=slack_team_id,
             slack_user_id=slack_user_id,
+            email=email,
+            real_name=real_name,
+            tz=tz,
         )
         user_id = user.id
         if user_id is None:
             logger.error("user_id None after get_or_create_user")
             return
+        workday_start = user.workday_start
+        workday_end = user.workday_end
+        user_notes = user.notes
 
     # 1) If this is a reply inside an active /wrike state machine thread, try
     # to route there. The helper may return extra_context (the task list) when
@@ -185,40 +230,13 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             logger.info(f"  → dispatched to /wrike state machine (user={user_id})")
             return
         if extra_context:
-            logger.info(f"  → non-scheduling /wrike reply; forwarding to agent with task-list context")
+            logger.info("  → non-scheduling /wrike reply; forwarding to agent with task-list context")
 
     # 2) Conversational agent. Reply lands as a thread on the user's message
     #    so subsequent in-thread replies share session memory.
 
     # Add 👀 reaction (fire-and-forget; we don't await the result for the hot path)
-    asyncio.create_task(_react_eyes(client, channel_id, msg_ts))
-
-    # Hydrate user profile (timezone, name, email)
-    try:
-        user_info_resp = await client.users_info(user=slack_user_id)
-        u = user_info_resp.get("user", {}) or {}
-        profile = u.get("profile", {}) or {}
-        tz = u.get("tz") or "UTC"
-        email = profile.get("email")
-        real_name = u.get("real_name") or profile.get("real_name") or u.get("name")
-    except Exception as exc:
-        logger.warning(f"users_info failed: {exc}")
-        tz = "UTC"
-        email = None
-        real_name = None
-
-    async with session_scope() as session:
-        user = await get_or_create_user(
-            session,
-            slack_team_id=slack_team_id,
-            slack_user_id=slack_user_id,
-            email=email,
-            real_name=real_name,
-            tz=tz,
-        )
-        workday_start = user.workday_start
-        workday_end = user.workday_end
-        user_notes = user.notes
+    _create_background_task(_react_eyes(client, channel_id, msg_ts))
 
     # Post the streaming placeholder in-thread.
     try:
@@ -228,7 +246,7 @@ async def _handle_dm_message(*, body: dict, client: AsyncWebClient, event: dict)
             text="🌀 Thinking…",
         )
         loading_ts = loading["ts"]
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to post loading placeholder")
         loading_ts = None
 

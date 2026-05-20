@@ -1,4 +1,4 @@
-"""/connect — DMs the user with three OAuth links and current connection status."""
+"""/connect — DMs the user with OAuth links and current connection status."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from loguru import logger
 from app.db.engine import session_scope
 from app.db.users import get_or_create_user
 from app.oauth import google as google_oauth
+from app.oauth import google_ads as google_ads_oauth
 from app.oauth import slack_user as slack_oauth
 from app.oauth import wrike as wrike_oauth
 from app.oauth.state import make_state
@@ -16,9 +17,11 @@ from app.slack_app.connection_status import status_for
 def _build_blocks(
     *,
     google_url: str,
+    google_ads_url: str,
     wrike_url: str,
     slack_url: str,
     google_done: bool,
+    google_ads_done: bool,
     wrike_done: bool,
     slack_done: bool,
 ) -> list[dict]:
@@ -54,6 +57,7 @@ def _build_blocks(
         },
         {"type": "divider"},
         row("Google Calendar", google_url, google_done),
+        row("Google Ads", google_ads_url, google_ads_done),
         row("Wrike", wrike_url, wrike_done),
         row("Slack search", slack_url, slack_done),
         {"type": "divider"},
@@ -64,7 +68,7 @@ def _build_blocks(
                     "type": "mrkdwn",
                     "text": (
                         "_Slack search lets the assistant find @-mentions across channels — "
-                        "needed for `/goodmorning`._"
+                        "needed for `/goodmorning`. Google Ads powers `/kpi`._"
                     ),
                 }
             ],
@@ -84,6 +88,10 @@ def register(app):
     # handler so Bolt doesn't log "Unhandled request".
     @app.action("connect_google_calendar")
     async def _noop_google(ack):
+        await ack()
+
+    @app.action("connect_google_ads")
+    async def _noop_google_ads(ack):
         await ack()
 
     @app.action("connect_wrike")
@@ -109,6 +117,9 @@ def register(app):
         google_state = make_state(
             provider="google", slack_team_id=slack_team_id, slack_user_id=slack_user_id
         )
+        google_ads_state = make_state(
+            provider="google_ads", slack_team_id=slack_team_id, slack_user_id=slack_user_id
+        )
         wrike_state = make_state(
             provider="wrike", slack_team_id=slack_team_id, slack_user_id=slack_user_id
         )
@@ -117,15 +128,18 @@ def register(app):
         )
 
         google_url = google_oauth.authorize_url(google_state)
+        google_ads_url = google_ads_oauth.authorize_url(google_ads_state)
         wrike_url = wrike_oauth.authorize_url(wrike_state)
         slack_url = slack_oauth.authorize_url(slack_state)
 
         status = await status_for(slack_team_id, slack_user_id)
         blocks = _build_blocks(
             google_url=google_url,
+            google_ads_url=google_ads_url,
             wrike_url=wrike_url,
             slack_url=slack_url,
             google_done=status.google,
+            google_ads_done=status.google_ads,
             wrike_done=status.wrike,
             slack_done=status.slack_user_token,
         )
@@ -151,5 +165,5 @@ def register(app):
             await client.chat_postEphemeral(
                 channel=body["channel_id"],
                 user=slack_user_id,
-                text="📬 Connect card sent to our DM.",
+                text="📬 I sent you a DM.",
             )

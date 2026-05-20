@@ -3,6 +3,7 @@
 Scope (hard rules — enforced both in code and via the system prompt):
 
   Calendar : list_events  ·  create_event  ·  update_event   (NO delete)
+  GoogleAds: fetch KPI reports only after user approval
   Wrike    : list_tasks   ·  get_task      ·  update_task_status  ·  post_task_comment
   Slack    : search_unreplied_mentions    (READ-ONLY — never sends/replies as user)
 
@@ -15,14 +16,18 @@ Two-phase approval:
 
 from __future__ import annotations
 
+import re as _re
 from datetime import datetime, timedelta
 from typing import Any
 
 from dateutil import parser as dateparser
 
 from app.integrations import google_calendar as gcal
+from app.integrations import google_ads
 from app.integrations import slack_search
 from app.integrations import wrike as wrike_int
+from app.formatters import kpi_blocks
+from app.llm.kpi_summary import explain_kpi_report
 from app.utils.timezone import (
     end_of_day,
     fmt_local_range,
@@ -31,7 +36,8 @@ from app.utils.timezone import (
     start_of_day,
     user_tz,
 )
-from app.utils.working_hours import first_free_slot_for_duration
+from app.utils.slack_mrkdwn import escape_slack_text, quote_slack_text
+from app.utils.working_hours import TimeSlot, first_free_slot_for_duration
 
 
 # ── Tool schemas exposed to Claude ─────────────────────────────────────────
@@ -356,6 +362,8 @@ async def dispatch_tool(
         return await _search_unreplied_mentions(
             inputs, user_id=user_id, slack_user_id=slack_user_id, bot_token=slack_bot_token
         )
+    if name == "fetch_google_ads_kpis":
+        return await _fetch_google_ads_kpis(inputs, user_id=user_id)
     if name == "update_working_hours":
         return await _update_working_hours(inputs, user_id=user_id)
     if name == "get_working_hours":
@@ -428,13 +436,15 @@ async def _conflict_alternate(
     title: str,
     base_args: dict,
     tool_name: str,
+    busy: list[TimeSlot] | None = None,
 ) -> dict | None:
     """If [start, end] overlaps existing events, return a pending-action dict
     that proposes the next free slot of the same duration on/after the
     requested start. Returns None if no alternative could be found.
     """
     duration_min = max(int((end - start).total_seconds() // 60), 15)
-    busy = await gcal.busy_slots_in_horizon(user_id, start, days=5)
+    if busy is None:
+        busy = await gcal.busy_slots_in_horizon(user_id, start, days=5)
     alt = first_free_slot_for_duration(
         busy,
         duration_minutes=duration_min,
@@ -469,20 +479,27 @@ async def _create_calendar_event(
     title = inputs.get("title", "").strip()
     start = _parse_dt(inputs["start_iso"], tz_name)
     end = _parse_dt(inputs["end_iso"], tz_name)
+    range_error = _validate_time_range(start, end)
+    if range_error:
+        return {"error": range_error}
     description = inputs.get("description", "")
     confirmed = bool(inputs.get("confirmed"))
+    safe_title = escape_slack_text(title or "(untitled)")
 
     if not confirmed:
         when = fmt_local_range(start, end, tz_name)
-        lines = [f"📅 Create *{title}* — *{when}*"]
+        lines = [f"📅 Create *{safe_title}* — *{when}*"]
 
         # Conflict check
-        overlaps = await gcal.find_overlaps(user_id, start, end)
+        horizon_events = await gcal.list_events(
+            user_id, time_min=start - timedelta(hours=4), time_max=start + timedelta(days=5)
+        )
+        overlaps = gcal.find_overlaps_in_events(horizon_events, start, end)
         alternate: dict | None = None
         if overlaps:
             ov = overlaps[0]
             ov_when = _format_overlap_when(ov, tz_name)
-            ov_title = ov.get("title") or "(untitled)"
+            ov_title = escape_slack_text(ov.get("title") or "(untitled)")
             extra = f" (+{len(overlaps) - 1} more)" if len(overlaps) > 1 else ""
             lines.append("")
             lines.append(f"⚠️ Overlaps *{ov_title}* ({ov_when}){extra}")
@@ -502,6 +519,7 @@ async def _create_calendar_event(
                     "end_iso": inputs["end_iso"],
                 },
                 tool_name="create_calendar_event",
+                busy=gcal.busy_slots_from_events(horizon_events),
             )
 
         result: dict = {
@@ -528,7 +546,7 @@ async def _create_calendar_event(
         "ok": True,
         "id": event.get("id"),
         "html_link": event.get("htmlLink"),
-        "message": f"Created event {title!r}.",
+        "message": f"Created event {escape_slack_text(title)!r}.",
     }
 
 
@@ -557,12 +575,36 @@ async def _update_calendar_event(
     new_description = inputs.get("description")
     new_start = _parse_dt(inputs["start_iso"], tz_name) if inputs.get("start_iso") else None
     new_end = _parse_dt(inputs["end_iso"], tz_name) if inputs.get("end_iso") else None
+    current_is_all_day = gcal.event_is_all_day(ev)
+
+    if new_start and new_end:
+        range_error = _validate_time_range(
+            new_start,
+            new_end,
+            max_hours=None if current_is_all_day else 12,
+        )
+        if range_error:
+            return {"error": range_error}
 
     if not any([new_title, new_description, new_start, new_end]):
         return {
             "error": "Nothing to update — provide at least one of title, description, "
             "start_iso, or end_iso."
         }
+
+    if new_start or new_end:
+        try:
+            effective_start = new_start or _parse_dt(cur_start_iso, tz_name)
+            effective_end = new_end or _parse_dt(cur_end_iso, tz_name)
+        except Exception as exc:
+            return {"error": f"Could not parse existing event time: {exc}"}
+        range_error = _validate_time_range(
+            effective_start,
+            effective_end,
+            max_hours=None if current_is_all_day else 12,
+        )
+        if range_error:
+            return {"error": range_error}
 
     if not confirmed:
         time_changed = bool(new_start or new_end)
@@ -577,7 +619,7 @@ async def _update_calendar_event(
         else:
             verb = "Update"
 
-        lines: list[str] = [f"📅 {verb} *{cur_title}*"]
+        lines: list[str] = [f"📅 {verb} *{escape_slack_text(cur_title)}*"]
 
         if time_changed:
             try:
@@ -596,7 +638,7 @@ async def _update_calendar_event(
             lines.append(f"*{cur_str}*  →  *{new_str}*" if new_str else f"*{cur_str}*")
 
         if title_changed:
-            lines.append(f"Title → *{new_title}*")
+            lines.append(f"Title → *{escape_slack_text(new_title)}*")
         if new_description is not None:
             lines.append("Description will be updated.")
 
@@ -610,8 +652,13 @@ async def _update_calendar_event(
                 effective_start = effective_end = None
 
             if effective_start and effective_end:
-                overlaps = await gcal.find_overlaps(
+                horizon_events = await gcal.list_events(
                     user_id,
+                    time_min=effective_start - timedelta(hours=4),
+                    time_max=effective_start + timedelta(days=5),
+                )
+                overlaps = gcal.find_overlaps_in_events(
+                    horizon_events,
                     effective_start,
                     effective_end,
                     exclude_event_id=event_id,
@@ -619,7 +666,7 @@ async def _update_calendar_event(
                 if overlaps:
                     ov = overlaps[0]
                     ov_when = _format_overlap_when(ov, tz_name)
-                    ov_title = ov.get("title") or "(untitled)"
+                    ov_title = escape_slack_text(ov.get("title") or "(untitled)")
                     extra = f" (+{len(overlaps) - 1} more)" if len(overlaps) > 1 else ""
                     lines.append("")
                     lines.append(f"⚠️ Overlaps *{ov_title}* ({ov_when}){extra}")
@@ -642,6 +689,7 @@ async def _update_calendar_event(
                         title=cur_title,
                         base_args=base_args,
                         tool_name="update_calendar_event",
+                        busy=gcal.busy_slots_from_events(horizon_events),
                     )
 
         result: dict = {
@@ -669,7 +717,7 @@ async def _update_calendar_event(
         "ok": True,
         "id": updated.get("id"),
         "html_link": updated.get("htmlLink"),
-        "message": f"Updated event {cur_title!r}.",
+        "message": f"Updated event {escape_slack_text(cur_title)!r}.",
     }
 
 
@@ -769,7 +817,9 @@ async def _update_wrike_task_status(inputs: dict, *, user_id: int) -> dict:
         return {
             "preview": True,
             "summary_for_user": (
-                f"Change Wrike task “{task.get('title')}” to status “{new_name}”."
+                "Change Wrike task "
+                f"“{escape_slack_text(task.get('title') or '(untitled)')}” "
+                f"to status “{escape_slack_text(new_name)}”."
             ),
             "next_action": (
                 "If the user approves, call update_wrike_task_status again with "
@@ -779,7 +829,13 @@ async def _update_wrike_task_status(inputs: dict, *, user_id: int) -> dict:
         }
 
     await client.update_task_status(task["id"], custom_status_id=target_id)
-    return {"ok": True, "message": f"Updated {task.get('title')!r} → {new_name}."}
+    return {
+        "ok": True,
+        "message": (
+            f"Updated {escape_slack_text(task.get('title') or '(untitled)')!r} "
+            f"→ {escape_slack_text(new_name)}."
+        ),
+    }
 
 
 async def _post_wrike_task_comment(inputs: dict, *, user_id: int) -> dict:
@@ -802,7 +858,9 @@ async def _post_wrike_task_comment(inputs: dict, *, user_id: int) -> dict:
         return {
             "preview": True,
             "summary_for_user": (
-                f"Post this comment on “{task.get('title')}”:\n> {text}"
+                "Post this comment on "
+                f"“{escape_slack_text(task.get('title') or '(untitled)')}”:\n"
+                f"{quote_slack_text(text)}"
             ),
             "next_action": (
                 "If the user approves, call post_wrike_task_comment again with the "
@@ -812,7 +870,10 @@ async def _post_wrike_task_comment(inputs: dict, *, user_id: int) -> dict:
         }
 
     await client.post_task_comment(task["id"], text=text)
-    return {"ok": True, "message": f"Comment posted on {task.get('title')!r}."}
+    return {
+        "ok": True,
+        "message": f"Comment posted on {escape_slack_text(task.get('title') or '(untitled)')!r}.",
+    }
 
 
 # ── Slack (read-only) implementation ───────────────────────────────────────
@@ -849,6 +910,33 @@ async def _search_unreplied_mentions(
     }
 
 
+# ── Google Ads KPI reporting ───────────────────────────────────────────────
+
+
+async def _fetch_google_ads_kpis(inputs: dict, *, user_id: int) -> dict:
+    if not bool(inputs.get("confirmed")):
+        return {"error": "Google Ads KPI pulls must be approved first."}
+    customer_id = google_ads.normalize_customer_id(inputs.get("customer_id"))
+    if not customer_id:
+        return {"error": "Missing Google Ads customer_id."}
+    mode = inputs.get("mode") if inputs.get("mode") in {"cpa", "roas"} else "cpa"
+    report = await google_ads.build_kpi_report(
+        user_id=user_id,
+        customer_id=customer_id,
+        mode=mode,
+        frozen_windows=inputs.get("windows"),
+    )
+    explanations = await explain_kpi_report(report)
+    blocks = kpi_blocks.report_blocks(report, explanations)
+    account = report.get("account") or {}
+    return {
+        "ok": True,
+        "message": f"KPI report for {escape_slack_text(account.get('name'))}.",
+        "settled_label": "Pulled",
+        "blocks": blocks,
+    }
+
+
 # ── /wrike scheduler (event + status update) ───────────────────────────────
 
 
@@ -878,12 +966,15 @@ async def _schedule_wrike_task(inputs: dict, *, user_id: int) -> dict:
         end = _parse_dt(inputs["end_iso"], tz_name)
     except Exception as exc:
         return {"error": f"Could not parse times: {exc}"}
+    range_error = _validate_time_range(start, end)
+    if range_error:
+        return {"error": range_error}
 
     if not confirmed:
         return {
             "preview": True,
             "summary_for_user": (
-                f"Schedule *{title}* — "
+                f"Schedule *{escape_slack_text(title)}* — "
                 f"{start.strftime('%a %b %-d, %-I:%M%p')}–"
                 f"{end.strftime('%-I:%M%p')}. "
                 f"Also marks the Wrike task as *{SCHEDULED_STATUS_NAME}*."
@@ -933,14 +1024,15 @@ async def _schedule_wrike_task(inputs: dict, *, user_id: int) -> dict:
         "ok": True,
         "event_id": event.get("id"),
         "html_link": event.get("htmlLink"),
-        "message": f"Scheduled *{title}* and marked as {SCHEDULED_STATUS_NAME}.{status_msg}",
+        "message": (
+            f"Scheduled *{escape_slack_text(title)}* and marked as "
+            f"{SCHEDULED_STATUS_NAME}.{escape_slack_text(status_msg)}"
+        ),
     }
 
 
 # ── User settings ──────────────────────────────────────────────────────────
 
-
-import re as _re
 
 _HHMM = _re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})$")
 
@@ -1050,7 +1142,7 @@ async def _update_user_notes(inputs: dict, *, user_id: int) -> dict:
             summary = "Clear your saved notes."
         else:
             preview = notes if len(notes) <= 200 else notes[:200] + "…"
-            summary = f"Save new notes:\n> {preview}"
+            summary = f"Save new notes:\n{quote_slack_text(preview)}"
         return {
             "preview": True,
             "summary_for_user": summary,
@@ -1093,6 +1185,16 @@ def _parse_dt(s: str, tz_name: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=user_tz(tz_name))
     return dt
+
+
+def _validate_time_range(
+    start: datetime, end: datetime, *, max_hours: int | None = 12
+) -> str | None:
+    if end <= start:
+        return "End time must be after start time."
+    if max_hours is not None and (end - start) > timedelta(hours=max_hours):
+        return f"Calendar blocks longer than {max_hours} hours are not supported here."
+    return None
 
 
 def _format_overlap_when(ov: dict, tz_name: str) -> str:

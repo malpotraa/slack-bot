@@ -21,8 +21,22 @@ class CalendarNotConnectedError(RuntimeError):
     pass
 
 
+_CREDENTIALS_CACHE: dict[int, Credentials] = {}
+_SERVICE_CACHE: dict[int, Any] = {}
+
+
+def invalidate_user_cache(user_id: int) -> None:
+    creds = _CREDENTIALS_CACHE.pop(user_id, None)
+    if creds is not None:
+        _SERVICE_CACHE.pop(id(creds), None)
+
+
 async def _credentials_for(user_id: int) -> Credentials:
     """Load + refresh credentials, persisting any new access_token."""
+    cached = _CREDENTIALS_CACHE.get(user_id)
+    if cached is not None and cached.valid:
+        return cached
+
     async with session_scope() as session:
         tok = await token_repo.get_google_token(session, user_id)
         if tok is None:
@@ -62,11 +76,21 @@ async def _credentials_for(user_id: int) -> Credentials:
                 scopes=" ".join(creds.scopes or []),
                 google_email=None,
             )
+    # Drop any prior cached creds + service for this user first. Without this,
+    # a silent token refresh builds a fresh Credentials object and the old
+    # _SERVICE_CACHE entry (keyed by the old object's id) would leak forever.
+    invalidate_user_cache(user_id)
+    _CREDENTIALS_CACHE[user_id] = creds
     return creds
 
 
 def _build_service(creds: Credentials):
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    cache_key = id(creds)
+    service = _SERVICE_CACHE.get(cache_key)
+    if service is None:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        _SERVICE_CACHE[cache_key] = service
+    return service
 
 
 async def list_events(
@@ -242,24 +266,17 @@ def event_to_busy_slot(event: dict) -> TimeSlot | None:
     return TimeSlot(start=s, end=e)
 
 
-async def find_overlaps(
-    user_id: int,
+def busy_slots_from_events(events: list[dict[str, Any]]) -> list[TimeSlot]:
+    return [s for s in (event_to_busy_slot(ev) for ev in events) if s]
+
+
+def find_overlaps_in_events(
+    events: list[dict[str, Any]],
     start: datetime,
     end: datetime,
     *,
     exclude_event_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a compact summary of events that overlap [start, end].
-
-    Skips: declined events, transparent (Free) events, all-day events, and the
-    event whose id matches `exclude_event_id` (used when updating an event so
-    we don't conflict-detect against itself).
-    """
-    from datetime import timedelta as _td
-
-    events = await list_events(
-        user_id, time_min=start - _td(hours=4), time_max=end + _td(hours=4)
-    )
     overlaps: list[dict[str, Any]] = []
     for ev in events:
         if exclude_event_id and ev.get("id") == exclude_event_id:
@@ -281,6 +298,29 @@ async def find_overlaps(
     return overlaps
 
 
+async def find_overlaps(
+    user_id: int,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_event_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return a compact summary of events that overlap [start, end].
+
+    Skips: declined events, transparent (Free) events, all-day events, and the
+    event whose id matches `exclude_event_id` (used when updating an event so
+    we don't conflict-detect against itself).
+    """
+    from datetime import timedelta as _td
+
+    events = await list_events(
+        user_id, time_min=start - _td(hours=4), time_max=end + _td(hours=4)
+    )
+    return find_overlaps_in_events(
+        events, start, end, exclude_event_id=exclude_event_id
+    )
+
+
 async def busy_slots_in_horizon(
     user_id: int, anchor: datetime, *, days: int = 5
 ) -> list[TimeSlot]:
@@ -291,7 +331,7 @@ async def busy_slots_in_horizon(
     events = await list_events(
         user_id, time_min=anchor - _td(hours=4), time_max=anchor + _td(days=days)
     )
-    return [s for s in (event_to_busy_slot(ev) for ev in events) if s]
+    return busy_slots_from_events(events)
 
 
 def classify_event(event: dict) -> str:

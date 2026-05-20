@@ -6,14 +6,17 @@ import asyncio
 import signal
 
 import uvicorn
+from cryptography.fernet import Fernet
 from loguru import logger
 
 from app.config import settings
 from app.db.engine import dispose, init_db
+from app.db.maintenance import cleanup_expired_rows
 from app.logging_setup import configure_logging
 from app.oauth.server import create_oauth_app
 from app.observability import configure_observability
 from app.slack_app.app import create_slack_app, run_socket_mode
+from app.utils.http_client import close_shared_async_clients
 
 
 async def _run_oauth_server() -> None:
@@ -50,6 +53,10 @@ async def _validate_startup() -> None:
             + ", ".join(missing)
             + ". In Cloud Run these come from --update-secrets and --set-env-vars."
         )
+    try:
+        Fernet(settings.token_encryption_key.encode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("TOKEN_ENCRYPTION_KEY is not a valid Fernet key.") from exc
 
 
 async def amain() -> None:
@@ -57,6 +64,7 @@ async def amain() -> None:
     await _validate_startup()
     configure_observability()
     await init_db()
+    await cleanup_expired_rows()
 
     slack_app = create_slack_app()
 
@@ -68,7 +76,7 @@ async def amain() -> None:
         logger.info("Shutdown signal received")
         stop.set()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _signal_handler)
@@ -77,19 +85,21 @@ async def amain() -> None:
 
     slack_task = asyncio.create_task(run_socket_mode(slack_app), name="slack-socket")
     http_task = asyncio.create_task(_run_oauth_server(), name="oauth-http")
+    stop_task = asyncio.create_task(stop.wait(), name="shutdown-signal")
 
     done, pending = await asyncio.wait(
-        {slack_task, http_task, asyncio.create_task(stop.wait())},
+        {slack_task, http_task, stop_task},
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     for t in pending:
         t.cancel()
     for t in done:
-        if t.exception() and t.get_name() != "Task-3":
+        if t.get_name() != "shutdown-signal" and t.exception():
             logger.error(f"Task {t.get_name()} crashed: {t.exception()}")
 
     await dispose()
+    await close_shared_async_clients()
     logger.info("Bye 👋")
 
 

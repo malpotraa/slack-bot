@@ -8,7 +8,135 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ## [Unreleased]
 
-Nothing pending right now. The previous release (`v1.7.2`) is what's queued for deploy.
+### Added
+
+- **Google Ads KPI command** via `/kpi google <account> [cpa|roas]`. The command searches only enabled non-manager accounts under the configured MCC, asks the user to disambiguate multiple matches, shows the exact frozen date ranges and scope, and then pulls the report only after the existing approve/deny card is approved.
+- **Google Ads OAuth provider** on `/connect`, using the `adwords` scope and encrypted per-user `GoogleAdsToken` storage. Google Ads is separate from Google Calendar so users explicitly consent to ad-performance access.
+- **Google Ads REST integration** using GAQL `searchStream` through the configured `GOOGLE_ADS_LOGIN_CUSTOMER_ID` MCC. KPI math is deterministic and computes CPA/ROAS from raw totals for last 7 days vs previous 7 days and month-to-date vs the same dates last month.
+- **Agent-written KPI explanations** from a bounded fact pack. The agent receives only precomputed metrics and top keyword-driver facts; it does not fetch data, choose accounts, or calculate spend metrics.
+- **`infrastructure/11-migrate-google-ads-kpi.sh`** creates the `googleadstoken` table for existing databases.
+
+### Changed
+
+- **Approval cards now support approved read actions** in addition to write actions. `fetch_google_ads_kpis` is allow-listed separately from write tools and still uses the same DB-backed one-time approval claim.
+- **Cloud Run secret mapping includes Google Ads runtime config:** `GOOGLE_ADS_DEVELOPER_TOKEN`, `GOOGLE_ADS_LOGIN_CUSTOMER_ID`, and `GOOGLE_ADS_API_VERSION=v22`.
+- **Google Ads KPI fetches now run independent GAQL calls concurrently** after the selected account is revalidated under the MCC. Campaign pairs and keyword-driver windows no longer wait on each other sequentially.
+- **Google Ads account search uses a short per-user MCC cache** to avoid repeated full `customer_client` scans while keeping account visibility scoped to the connected user.
+- **HTTP integrations reuse shared `httpx.AsyncClient` instances** for keep-alive connection reuse across Google Ads, Wrike, and OAuth calls.
+- **Conversational Calendar prefetch is skipped on existing threads and cached briefly per thread** so casual follow-ups do not pay an extra Calendar API round trip before the LLM call.
+- **Calendar conflict handling reuses one horizon event fetch** for both overlap detection and alternate-slot calculation in agent Calendar previews and `/wrike` scheduling.
+- **Google Calendar credentials and service objects are cached in-process** to avoid repeated token DB reads, Fernet decrypts, and service reconstruction during hot flows.
+
+### Fixed
+
+- **OAuth callback failures no longer expose internal exception text** in the browser. Detailed errors stay in server logs; users see a generic reconnect message.
+- **Fire-and-forget tasks are retained until completion** for OAuth connect-card cleanup and Slack reaction helpers, preventing intermittent cleanup/reaction loss and retrieving task exceptions for logging.
+- **`/connect` card cleanup no longer waits for optional Google Ads.** Core integrations are Google Calendar, Wrike, and Slack search; users can reconnect later for Google Ads when they need `/kpi`.
+- **Conversation history appends are serialized per Slack thread** to reduce lost updates between agent finalization and approval-card settlement.
+- **DM handling avoids a duplicate user upsert** by fetching Slack profile data before the single `get_or_create_user()` call.
+- **Shutdown task naming is explicit** instead of comparing against an auto-generated `Task-3`.
+- **Startup validates `TOKEN_ENCRYPTION_KEY` as a Fernet key** so malformed encryption config fails at boot rather than first token operation.
+- **Expired sessions and old approval rows are purged at startup** as a lightweight cleanup guard.
+- **Google Ads connect prompts now settle after OAuth success.** One-off `/kpi` connect prompts update to "Google Ads connected" and self-delete after a short delay.
+- **KPI approval cards are easier to scan.** Account, metric, date ranges, and scope are split into clearer sections with a KPI emoji and `📊 Pull KPI` button.
+- **KPI approvals show an immediate working state.** After the approval is claimed, the card changes to "Fetching Google Ads KPI report..." before the slower Ads API calls run, making double-clicks visibly unnecessary.
+- **`/kpi` now stays in the invoking thread.** The command posts an emoji status message first, then places account selection, approval, connect prompts, and final KPI output in that same thread instead of moving the workflow to DM.
+- **KPI fetching state is cleaner.** The approved card is replaced by a no-button progress message rather than showing user-facing double-click instructions.
+
+### Why & tradeoffs
+
+- *Why Google Ads REST API instead of MCP?* `/kpi` is a deterministic production command running in Cloud Run. REST avoids hosting an MCP client/server path, matches the repo's existing `httpx` integrations, and keeps quota, auth, and error handling under our control.
+- *Why keep the LLM out of metric math?* Spend and conversion arithmetic must be reproducible. The code calculates all KPI values and deltas; the model only turns prepared facts into short explanations.
+- *Why require one MCC?* The requested behavior is to work under one configured manager account, regardless of other accounts the connected Google user can access. The fetch path revalidates the selected customer under that MCC before querying performance data.
+- *Why clean `/connect` after the core integrations instead of all four?* Google Ads is only required for `/kpi`; requiring it for the baseline connect-card cleanup leaves stale cards for users who only need the daily assistant workflow.
+- *Why cache Calendar credentials in process?* Cloud Run is pinned to one instance for Socket Mode and OAuth reconnects invalidate the cache. This removes repeated DB/decrypt work on common multi-step calendar flows while keeping refresh-token persistence unchanged.
+- *Why track the Google Ads connect prompt separately from `/connect`?* `/kpi` can prompt for Google Ads directly. Tracking that prompt lets the OAuth callback clean up the exact stale message that sent the user to connect.
+
+---
+
+## [1.8.0] — 2026-05-19
+
+Security-hardening + operational cleanup after a full prod-tree review. This release closes the highest-risk findings from the audit: local secret leakage into Docker builds, unredacted DB credentials in logs, OAuth callback validation gaps, replayable Slack approval buttons, overly broad Secret Manager IAM, and sensitive trace payloads leaving the service by default.
+
+### Pre-deploy migration (required for existing DBs)
+
+```bash
+./infrastructure/10-migrate-security-hardening.sh
+```
+
+The migration runs inside one transaction, creates the `approvalexecution` table, deduplicates legacy rows, and adds uniqueness constraints used by the runtime:
+
+- `approvalexecution.approval_key` for one-time Slack approval-card claims.
+- `"user"(slack_team_id, slack_user_id)` so one Slack identity maps to one user row.
+- `conversationsession(user_id, channel_id, thread_ts)` so one Slack thread maps to one session row.
+- `workflowstatuscache(user_id, status_name, custom_status_id)` so repeated Wrike status resolution does not create duplicate cache rows.
+
+If any statement fails, the transaction rolls back. Duplicate legacy users are merged onto the newest row for that Slack identity; duplicate sessions/status-cache rows keep the newest row.
+
+### Security
+
+- **Docker build-context secret exclusion.** `.dockerignore` now excludes `infrastructure-secrets.env`, `infrastructure/secrets.env`, `*.pem`, and `*.key`. This closes the gap where `02-create-secrets.sh` correctly asked the operator to create `prod/infrastructure-secrets.env`, but the Dockerfile's `COPY . .` would include it in the build context if present locally.
+- **Database URL logging is redacted** in `app/db/engine.py`. Startup now renders the SQLAlchemy URL with `hide_password=True` instead of logging the full `DATABASE_URL`, which includes the Cloud SQL app-user password.
+- **OAuth callback HTML is escaped** in `app/oauth/server.py`. Provider `error` query strings and exception messages are now HTML-escaped before being embedded in the public callback response, removing a reflected-XSS surface on `/oauth/{google|wrike|slack}/callback`.
+- **OAuth state provider is validated** in every callback. `state.provider` must match the callback route (`google`, `wrike`, or `slack_user`), so a state minted for one provider cannot be replayed against another callback.
+- **Slack user-token callback validates identity.** The Slack OAuth response's `authed_user.id` and `team.id`, when present, must match the signed state before storing the xoxp token. This prevents accidentally linking the wrong Slack user/workspace token to the app's internal user row.
+- **Slack approval buttons are one-time.** `app/slack_app/approval.py` now claims a DB row keyed by `(team, channel, message_ts)` before dispatching any write tool. Duplicate clicks or Slack retries hit the unique key and return without re-running Calendar/Wrike writes.
+- **Slack mrkdwn escaping added for untrusted text.** `app/utils/slack_mrkdwn.py` now exposes `escape_slack_text()` and `quote_slack_text()`. Calendar titles, Wrike task titles/comments, Slack snippets, notes previews, and failure messages are escaped before being interpolated into Block Kit `mrkdwn` surfaces.
+- **Wrike REST failure logs are sanitized.** `app/integrations/wrike.py` now logs `safe_error_summary(resp)` instead of raw `resp.text`, matching the OAuth modules' earlier redaction approach.
+- **Trace payloads are redacted by default.** New `TRACE_SENSITIVE_DATA=false` setting in `app/config.py` prevents user prompts, tool inputs/outputs, and user email from being exported in custom Phoenix spans by default. Anthropic auto-instrumentation is skipped unless this flag is explicitly enabled.
+- **Runtime Secret Manager IAM narrowed.** `infrastructure/03-create-artifact-registry.sh` no longer grants project-wide `roles/secretmanager.secretAccessor` to the Cloud Run runtime SA. `02-create-secrets.sh` now grants `secretAccessor` on each managed secret individually.
+- **Secret upload script now fails fast if the runtime SA does not exist.** `02-create-secrets.sh` verifies `${RUN_SA}@${PROJECT_ID}.iam.gserviceaccount.com` and tells the operator to run `03-create-artifact-registry.sh` first. This makes the new per-secret IAM model explicit instead of allowing a runtime secret-access failure after deploy.
+
+### Added
+
+- **`ApprovalExecution` SQLModel table** in `app/db/models.py` to track approval-card claims and final status (`claimed`, `succeeded`, `failed`, `cancelled`).
+- **`infrastructure/10-migrate-security-hardening.sh`** to apply the production DB schema changes in one transaction, including legacy duplicate cleanup before unique indexes are added.
+- **`TRACE_SENSITIVE_DATA` documented** in `.env.example` and `README.md`, defaulting to `false`.
+- **Shell syntax validation target coverage** for the new migration script via the same `bash -n` pattern used during verification.
+
+### Changed
+
+- **Cloud Run deploy now attaches the intended runtime service account.** `cloudbuild.yaml` accepts `_RUN_SA_EMAIL` and passes `--service-account=...`; `04-build-and-deploy.sh` and `06-create-cicd-trigger.sh` provide the substitution from `RUN_SA`.
+- **Cloud SQL helper scripts handle local secret files more cautiously.** `01-create-cloud-sql.sh` writes the postgres root password and generated DATABASE_URL files with mode `600`, stops printing the credentialed DATABASE_URL to stdout, and tells the operator to delete the local files after copying values into Secret Manager.
+- **Calendar/Wrike write previews validate time ranges.** Calendar event creation/update and `schedule_wrike_task` now reject `end <= start` and timed blocks longer than 12 hours. Existing all-day calendar events skip the 12-hour cap so users can still move all-day events. `/wrike` now returns immediately on durations over 8 hours instead of posting a warning and continuing to approval.
+- **Observability defaults favor privacy over detail.** Custom spans still record operational metadata (model, token counts, tool names, session/channel ids), but content-bearing attributes are replaced with `[redacted]` unless `TRACE_SENSITIVE_DATA=true`.
+- **Dependency surface reduced.** Removed unused `claude-agent-sdk` from `pyproject.toml`; the app uses `anthropic` directly. `uv.lock` dropped the unused transitive MCP/jsonschema/SSE dependencies.
+- **Existing approval-card UX tweaks preserved.** The prior local changes that distinguish `approved_alternate` outcomes and improve update-event button labels are now folded into the hardened approval handler.
+
+### Fixed
+
+- **Ruff violations from the audit pass.** Moved the late `re` import in `app/agent/tools.py`, replaced a `/wrike` lambda with a small `def`, removed an unnecessary f-string, and removed an unused exception binding.
+- **Potential duplicate user/session rows under concurrency.** Database uniqueness now enforces the logical identity constraints; `get_or_create_user()` uses a nested transaction for the insert race and reloads the existing row without rolling back unrelated outer-session work.
+- **Cold-cache Wrike status races handled.** Concurrent `resolve_status_ids()` calls can now race on the new status-cache unique index without surfacing a tool error; the loser rolls back just the cache write and returns the API-resolved IDs.
+- **Approval claim errors no longer look like replays.** `_claim_approval()` treats only the approval-key unique violation as "already claimed"; other `IntegrityError`s are logged and the card updates with a clear failure.
+- **Slack OAuth error logging no longer prints full response bodies.** `app/oauth/slack_user.py` now logs only the structured Slack error code.
+
+### Removed
+
+- **Unused `claude-agent-sdk` dependency.** This trims install size and removes transitive packages not used by the production runtime.
+
+### Verification
+
+```bash
+python3 -m compileall app scripts
+uv --cache-dir /private/tmp/uv-cache run ruff check .
+uv --cache-dir /private/tmp/uv-cache tool run pip-audit --path .venv
+bash -n infrastructure/01-create-cloud-sql.sh infrastructure/02-create-secrets.sh infrastructure/03-create-artifact-registry.sh infrastructure/04-build-and-deploy.sh infrastructure/06-create-cicd-trigger.sh infrastructure/10-migrate-security-hardening.sh
+```
+
+All passed. `pip-audit` reported no known vulnerabilities in the installed environment.
+
+### Why & tradeoffs
+
+- *Why make this `1.8.0` rather than a patch?* The release adds runtime schema (`approvalexecution`), a required migration, new config semantics for tracing, IAM behavior changes, and dependency changes. This is more than a narrow bug fix.
+- *Why DB-backed approval idempotency instead of just disabling buttons after click?* Slack retries and near-simultaneous double-clicks can arrive before a UI update lands. The DB unique key is the authoritative guard, works across process restarts, and protects every write tool uniformly.
+- *Why key approvals by message timestamp instead of embedding a new nonce in every button value?* Existing approval cards already have a stable Slack message identity and Slack message timestamps are unique within a channel. This avoids growing the 2000-character button `value` payload. Tradeoff: a single approval card can settle only once, which matches the UI model.
+- *Why auto-clean duplicates in the migration now?* The status cache is expected to have duplicates from pre-unique behavior, and a half-applied migration is worse than deterministic cleanup. The script keeps the newest user/session/status-cache row, moves dependent token/session/cache rows from duplicate users onto the keeper, and deletes duplicate token rows only when the keeper already has that integration token.
+- *Why skip Anthropic auto-instrumentation when `TRACE_SENSITIVE_DATA=false`?* The third-party instrumentor can capture full prompts/responses outside our custom span redaction layer. Disabling it by default is the only reliable privacy posture unless the tracing sink is explicitly approved for content.
+- *Tradeoff: traces are less useful by default.* Operators still get span timing, tool names, token counts, user/session identifiers, and error statuses, but not message bodies or tool payloads. For deep debugging, temporarily set `TRACE_SENSITIVE_DATA=true` after confirming the trace backend is approved for sensitive workplace data.
+- *Why narrow Secret Manager IAM per secret?* Project-wide `secretAccessor` is convenient but means any future secret in the project becomes readable by the runtime service account. Per-secret grants keep the blast radius aligned to exactly the secrets this service needs. Tradeoff: adding a new runtime secret now requires `02-create-secrets.sh` or an explicit IAM binding.
+- *Why keep local `/tmp` password files at all?* The existing scripts use them to bridge provisioning and later migration/setup commands. This release makes them mode `600` and stops printing credentialed URLs to stdout, but they are still local operator artifacts. Delete `/tmp/${SERVICE_NAME}-pg-root.pwd` and `/tmp/${SERVICE_NAME}-database-url` after use if you do not need rerunnable local maintenance scripts.
+- *Why remove `claude-agent-sdk`?* The app imports `anthropic` directly and never imports the SDK. Keeping an unused 50MB+ package and its MCP transitive dependencies increases build time, image size, and audit surface without runtime benefit.
 
 ---
 

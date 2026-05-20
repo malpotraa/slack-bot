@@ -18,13 +18,14 @@ DO_BUILD=1
 PLACEHOLDER_URL="https://placeholder.invalid"
 
 PHOENIX_ENDPOINT_DEFAULT="${PHOENIX_ENDPOINT:-https://app.phoenix.arize.com/s/abhishek}"
+RUN_SA_EMAIL="${RUN_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # Submit the build (which also deploys via the cloudbuild.yaml step)
 if [[ $DO_BUILD -eq 1 ]]; then
   echo "▶ Submitting Cloud Build (this takes 4–7 minutes the first time)..."
   gcloud builds submit \
     --config=cloudbuild.yaml \
-    --substitutions=_REGION="${REGION}",_SERVICE_NAME="${SERVICE_NAME}",_AR_REPO="${AR_REPO}",_SQL_INSTANCE="${SQL_CONNECTION_NAME}",_APP_BASE_URL="${APP_BASE_URL:-${PLACEHOLDER_URL}}",_PHOENIX_ENDPOINT="${PHOENIX_ENDPOINT_DEFAULT}" \
+    --substitutions=_REGION="${REGION}",_SERVICE_NAME="${SERVICE_NAME}",_AR_REPO="${AR_REPO}",_SQL_INSTANCE="${SQL_CONNECTION_NAME}",_APP_BASE_URL="${APP_BASE_URL:-${PLACEHOLDER_URL}}",_PHOENIX_ENDPOINT="${PHOENIX_ENDPOINT_DEFAULT}",_RUN_SA_EMAIL="${RUN_SA_EMAIL}" \
     .
 fi
 

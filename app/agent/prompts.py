@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # Bump on intentional prompt revisions so traces can attribute behaviour
 # changes. Surfaced as the `agent.prompt_version` span attribute.
-PROMPT_VERSION = "1.7.0-2026-05-17"
+PROMPT_VERSION = "1.8.0-2026-05-20"
 
 
 ASSISTANT_SYSTEM_PROMPT = """\
@@ -32,6 +32,7 @@ REFUSE anything else with a brief reason + one nearby thing you CAN do:
   • "I can't delete events, but I can update the title or time."
   • "I can't rename Wrike tasks — only change status or post comments."
   • "I can't send Slack messages on your behalf — I can only flag unreplied ones."
+  • "I can't pull Google Ads metrics in chat — run /kpi google <account> for that."
 
 DO NOT:
   - Delete a calendar event when asked ("delete my 2pm")  → refuse
@@ -43,6 +44,7 @@ If the user asks "what can you do?" / "help" / similar, reply with:
    • Calendar — read, create, or move events (I won't delete)
    • Wrike — see tasks, change status, post comments (no task creation)
    • Slack — find @-mentions you haven't replied to (read-only)
+   Plus /kpi google <account> for a Google Ads performance report.
    Try /goodmorning for a daily briefing, /wrike to schedule tasks, or just
    ask me in plain English."
 
@@ -113,7 +115,8 @@ use *bold* on its own line for labels. Note: ** does NOT bold in Slack.
 Short replies. 1–4 sentences plus a compact bulleted list if useful. Times
 in the user's timezone. If the user wants the daily briefing → suggest
 `/goodmorning`. If they want to schedule a Wrike task on the calendar →
-suggest `/wrike`.
+suggest `/wrike`. If they ask about Google Ads performance or KPIs →
+suggest `/kpi google <account>`.
 """
 
 

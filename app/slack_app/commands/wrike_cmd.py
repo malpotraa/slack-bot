@@ -7,6 +7,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.config import settings
 from app.db.engine import session_scope
 from app.db.users import get_or_create_user
 from app.formatters import wrike_blocks as wb
@@ -19,6 +20,8 @@ from openinference.semconv.trace import SpanAttributes
 from app.observability import start_span
 from app.sessions import store as session_store
 from app.slack_app.approval import build_approval_blocks_with_alternates
+from app.slack_app.connect_prompt import connect_prompt_blocks
+from app.utils.slack_mrkdwn import escape_slack_text
 from app.utils.timezone import end_of_day, now_in, start_of_day, user_tz
 from app.utils.working_hours import (
     TimeSlot,
@@ -122,7 +125,7 @@ def register(app):
         with start_span("command.wrike.start", kind=Kind.CHAIN) as span:
             span.set_attribute("user.id", slack_user_id)
             span.set_attribute("user.name", real_name or "")
-            if email:
+            if email and settings.trace_sensitive_data:
                 span.set_attribute("user.email", email)
             span.set_attribute("user.slack_id", slack_user_id)
             span.set_attribute("user.db_id", str(user_id))
@@ -142,7 +145,16 @@ def register(app):
             except wrike_int.WrikeNotConnectedError:
                 await client.chat_postMessage(
                     channel=target_channel,
-                    text="Wrike isn't connected yet — run `/connect` to set it up.",
+                    text="Wrike isn't connected yet.",
+                    blocks=connect_prompt_blocks(
+                        "wrike",
+                        slack_team_id=slack_team_id,
+                        slack_user_id=slack_user_id,
+                        reason=(
+                            "Wrike isn't connected yet. Connect it, then run "
+                            "`/wrike` again."
+                        ),
+                    ),
                 )
                 if not invoked_in_dm:
                     await client.chat_postEphemeral(
@@ -189,7 +201,7 @@ def register(app):
             await client.chat_postEphemeral(
                 channel=body["channel_id"],
                 user=slack_user_id,
-                text="📬 Sent the task list to our DM.",
+                text="📬 I sent you a DM.",
             )
 
         await session_store.save_command_state(
@@ -415,8 +427,9 @@ async def _handle_thread_turn(
         await client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text="That's longer than 8 hours — confirm by saying *force* if you really mean it.",
+            text="That's longer than 8 hours — pick a shorter duration.",
         )
+        return
 
     # Resolve which task is being scheduled
     idx = task_index
@@ -453,23 +466,35 @@ async def _handle_thread_turn(
             "summary": summary,
         }
 
-    # Overlap check (skip if force_overlap requested by extractor)
-    overlapping = (
-        [] if intent.force_overlap else await _find_overlaps(user_id, proposed_start, proposed_end)
-    )
+    # Overlap check (skip if force_overlap requested by extractor). When we
+    # need conflict handling, fetch the 5-day horizon once and reuse it for the
+    # suggested alternate slot instead of doing a second Calendar pull.
+    horizon_busy: list[TimeSlot] = []
+    if intent.force_overlap:
+        overlapping = []
+    else:
+        horizon_events = await gcal.list_events(
+            user_id,
+            time_min=proposed_start - timedelta(hours=4),
+            time_max=proposed_start + timedelta(days=5),
+        )
+        overlapping = gcal.find_overlaps_in_events(
+            horizon_events, proposed_start, proposed_end
+        )
+        horizon_busy = gcal.busy_slots_from_events(horizon_events)
 
-    fmt_day_time = lambda s, e: (
-        f"{s.strftime('%a %b %-d, %-I:%M%p')}–{e.strftime('%-I:%M%p')}"
-    )
+    def fmt_day_time(s: datetime, e: datetime) -> str:
+        return f"{s.strftime('%a %b %-d, %-I:%M%p')}–{e.strftime('%-I:%M%p')}"
+
+    safe_task_title = escape_slack_text(task_title)
     proposed_summary = (
-        f"Schedule *{task_title}* at *{fmt_day_time(proposed_start, proposed_end)}* "
+        f"Schedule *{safe_task_title}* at *{fmt_day_time(proposed_start, proposed_end)}* "
         f"(also marks the Wrike task as *Accepted & Scheduled*)."
     )
 
     if not overlapping:
         # Clean slot — single approval card
         blocks = build_approval_blocks_with_alternates(
-            intro_text="🔔  *Approval needed* — confirm the scheduling below.",
             primary=_action_for(proposed_start, proposed_end, proposed_summary),
         )
         await client.chat_postMessage(
@@ -485,7 +510,7 @@ async def _handle_thread_turn(
 
     # Overlap → offer both options on one card
     suggested = first_free_slot_for_duration(
-        busy=await _busy_for_horizon(user_id, proposed_start, days=5),
+        busy=horizon_busy,
         duration_minutes=int(duration_minutes),
         horizon_days=5,
         workday_start=state["workday_start"],
@@ -494,10 +519,12 @@ async def _handle_thread_turn(
         not_before=proposed_start,
     )
     overlap_lines = "\n".join(
-        f"  • {ov.get('title') or '(untitled)'}" for ov in overlapping[:3]
+        f"  • {escape_slack_text(ov.get('title') or '(untitled)')}"
+        for ov in overlapping[:3]
     )
     intro = (
-        f"⚠️  *Overlap detected.* {fmt_day_time(proposed_start, proposed_end)} overlaps with:\n"
+        f"🔔 *Approval needed* — ⚠️ *Overlap detected.*\n"
+        f"{fmt_day_time(proposed_start, proposed_end)} overlaps with:\n"
         f"{overlap_lines}\n\n"
         f"Pick one option below."
     )

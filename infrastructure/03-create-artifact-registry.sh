@@ -28,7 +28,7 @@ fi
 
 # Grant runtime roles
 echo "▶ Granting roles to ${SA_EMAIL}"
-for role in roles/cloudsql.client roles/secretmanager.secretAccessor roles/logging.logWriter; do
+for role in roles/cloudsql.client roles/logging.logWriter; do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="${role}" \
@@ -46,7 +46,7 @@ CB_SA_COMPUTE="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
 for SA in "${CB_SA_LEGACY}" "${CB_SA_COMPUTE}"; do
   echo "▶ Granting Cloud Build deploy permissions (${SA})"
-  for role in roles/run.admin roles/iam.serviceAccountUser roles/secretmanager.secretAccessor roles/artifactregistry.writer roles/logging.logWriter; do
+  for role in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.writer roles/logging.logWriter; do
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${SA}" \
       --role="${role}" \

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -39,16 +39,33 @@ class User(SQLModel, table=True):
     # via the same tool with an empty string.
     notes: str | None = None
     # Tracks the most recent /connect card we posted so we can clean it up
-    # once all three integrations are connected.
+    # once all required integrations are connected.
     connect_card_channel_id: str | None = None
     connect_card_ts: str | None = None
+    google_ads_connect_channel_id: str | None = None
+    google_ads_connect_ts: str | None = None
     created_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
     updated_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
 
-    __table_args__ = ({"sqlite_autoincrement": True},)
+    __table_args__ = (
+        UniqueConstraint("slack_team_id", "slack_user_id", name="uq_user_slack_identity"),
+        {"sqlite_autoincrement": True},
+    )
 
 
 class GoogleToken(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", unique=True, index=True)
+    encrypted_refresh_token: str
+    encrypted_access_token: str | None = None
+    access_token_expires_at: datetime | None = Field(default=None, sa_type=_TS)
+    scopes: str = ""
+    google_email: str | None = None
+    created_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+
+
+class GoogleAdsToken(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", unique=True, index=True)
     encrypted_refresh_token: str
@@ -97,6 +114,29 @@ class ConversationSession(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
     expires_at: datetime | None = Field(default=None, sa_type=_TS)
 
+    __table_args__ = (
+        UniqueConstraint("user_id", "channel_id", "thread_ts", name="uq_session_thread"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+class ApprovalExecution(SQLModel, table=True):
+    """One-time claim for a Slack approval-card message."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    approval_key: str = Field(unique=True, index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    slack_team_id: str = Field(index=True)
+    slack_user_id: str = Field(index=True)
+    channel_id: str = Field(index=True)
+    message_ts: str = Field(index=True)
+    action_id: str
+    tool_name: str
+    status: str = "claimed"
+    error: str | None = None
+    created_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+
     __table_args__ = ({"sqlite_autoincrement": True},)
 
 
@@ -109,3 +149,12 @@ class WorkflowStatusCache(SQLModel, table=True):
     custom_status_id: str
     workflow_id: str
     cached_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "status_name",
+            "custom_status_id",
+            name="uq_workflow_status_cache_entry",
+        ),
+    )
