@@ -7,14 +7,15 @@ a pending_action. The handler posts an approval card (this module's
 module). Approve re-dispatches the tool with confirmed=true. Disapprove
 just marks the card cancelled.
 
-Button `value` carries a JSON payload: {"tool": ..., "args": ...}.
-Slack's per-value limit is 2000 chars; our tool args are well under that.
+Button `value` carries only an opaque token. The executable tool args are kept
+server-side in ApprovalRequest rows, so Slack clients never receive them.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from loguru import logger
@@ -25,8 +26,9 @@ from sqlmodel import select
 from app.agent.tools import dispatch_tool
 from app.config import settings
 from app.db.engine import session_factory, session_scope
-from app.db.models import ApprovalExecution
+from app.db.models import ApprovalExecution, ApprovalRequest
 from app.db.users import get_user_by_slack_id
+from app.integrations.google_ads import normalize_customer_id
 from app.sessions import store as session_store
 from app.utils.slack_mrkdwn import escape_slack_text
 
@@ -35,12 +37,10 @@ APPROVE_ACTION_ID = "agent_approve"
 APPROVE_ALT_ACTION_ID = "agent_approve_alt"
 DISAPPROVE_ACTION_ID = "agent_disapprove"
 
-# Defense-in-depth: only these tool names may be dispatched via the approval-
-# button handler. Slack signs the outer interaction (Bolt verifies), but the
-# payload JSON we put in the button `value` is not signed by us. Restricting
-# to a known write-tool list means even a forged or replayed payload can only
-# trigger one of our intended actions — not, say, list-only tools or any
-# future tool a future change adds inadvertently.
+# Defense-in-depth: only these tool names may be stored and dispatched through
+# the approval-button handler. Slack signs the outer interaction (Bolt verifies),
+# and button values carry only opaque tokens, but the allow-list also prevents a
+# future code path from storing an unintended tool as an approval action.
 WRITE_TOOL_ALLOWLIST: set[str] = {
     "create_calendar_event",
     "update_calendar_event",
@@ -55,14 +55,24 @@ APPROVED_READ_TOOL_ALLOWLIST: set[str] = {
 }
 APPROVAL_TOOL_ALLOWLIST = WRITE_TOOL_ALLOWLIST | APPROVED_READ_TOOL_ALLOWLIST
 
+# A successful /kpi pull marks the thread as a Google Ads thread, so follow-up
+# questions there reuse the account without re-specifying it. The conversational
+# Ads agent (get_google_ads_data) writes the same state itself — see handlers.
+_ADS_STICKY_TOOLS: set[str] = {
+    "fetch_google_ads_kpis",
+}
+_ADS_QA_SESSION = "ads_qa"
+
 # Every approval card opens with this header so the agent, /wrike, and /kpi
 # all post a visually consistent card. Pass intro_text="" to suppress it.
 DEFAULT_APPROVAL_INTRO = "🔔 *Approval needed*"
+_APPROVAL_REQUEST_TTL_MINUTES = 60
 
 
-def build_approval_blocks(
+async def build_approval_blocks(
     pending_actions: list[dict[str, Any]],
     *,
+    user_id: int,
     intro_text: str | None = None,
     primary_button_text: str = "✅ Confirm",
     cancel_button_text: str = "❌ Cancel",
@@ -86,7 +96,13 @@ def build_approval_blocks(
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": summary}}
         )
-        payload = _encode_payload(action["tool"], action.get("args") or {}, summary)
+        payload = await _store_payload(
+            user_id=user_id,
+            action_id=APPROVE_ACTION_ID,
+            tool=action["tool"],
+            args=action.get("args") or {},
+            summary=summary,
+        )
         blocks.append(
             {
                 "type": "actions",
@@ -104,7 +120,7 @@ def build_approval_blocks(
                         "text": {"type": "plain_text", "text": cancel_button_text},
                         "style": "danger",
                         "action_id": DISAPPROVE_ACTION_ID,
-                        "value": payload,
+                        "value": _encode_cancel_payload(),
                     },
                 ],
             }
@@ -113,17 +129,35 @@ def build_approval_blocks(
     return blocks
 
 
-def _encode_payload(tool: str, args: dict[str, Any], summary: str) -> str:
-    payload = json.dumps({"tool": tool, "args": args, "summary": summary[:300]})
-    if len(payload) > 1900:
-        payload = json.dumps(
-            {"tool": tool, "args": args, "summary": "(summary truncated)", "_truncated": True}
-        )[:1990]
-    return payload
-
-
-def build_approval_blocks_with_alternates(
+async def _store_payload(
     *,
+    user_id: int,
+    action_id: str,
+    tool: str,
+    args: dict[str, Any],
+    summary: str,
+) -> str:
+    token = await _store_pending_approval(
+        user_id=user_id,
+        action_id=action_id,
+        tool=tool,
+        args=args,
+        summary=summary,
+    )
+    return _encode_payload(token)
+
+
+def _encode_payload(token: str) -> str:
+    return json.dumps({"approval_token": token}, separators=(",", ":"))
+
+
+def _encode_cancel_payload() -> str:
+    return json.dumps({"cancel": True}, separators=(",", ":"))
+
+
+async def build_approval_blocks_with_alternates(
+    *,
+    user_id: int,
     primary: dict[str, Any],
     alternate: dict[str, Any] | None = None,
     intro_text: str | None = None,
@@ -162,8 +196,12 @@ def build_approval_blocks_with_alternates(
             "text": {"type": "plain_text", "text": primary_button_text},
             "style": "primary",
             "action_id": APPROVE_ACTION_ID,
-            "value": _encode_payload(
-                primary["tool"], primary["args"], primary.get("summary") or ""
+            "value": await _store_payload(
+                user_id=user_id,
+                action_id=APPROVE_ACTION_ID,
+                tool=primary["tool"],
+                args=primary["args"],
+                summary=primary.get("summary") or "",
             ),
         }
     ]
@@ -173,10 +211,12 @@ def build_approval_blocks_with_alternates(
                 "type": "button",
                 "text": {"type": "plain_text", "text": alternate_button_text},
                 "action_id": APPROVE_ALT_ACTION_ID,
-                "value": _encode_payload(
-                    alternate["tool"],
-                    alternate["args"],
-                    alternate.get("summary") or "",
+                "value": await _store_payload(
+                    user_id=user_id,
+                    action_id=APPROVE_ALT_ACTION_ID,
+                    tool=alternate["tool"],
+                    args=alternate["args"],
+                    summary=alternate.get("summary") or "",
                 ),
             }
         )
@@ -186,7 +226,7 @@ def build_approval_blocks_with_alternates(
             "text": {"type": "plain_text", "text": cancel_button_text},
             "style": "danger",
             "action_id": DISAPPROVE_ACTION_ID,
-            "value": _encode_payload("(none)", {}, "cancelled"),
+            "value": _encode_cancel_payload(),
         }
     )
     blocks.append({"type": "actions", "block_id": "approval_multi", "elements": elements})
@@ -209,6 +249,86 @@ async def _resolve_user_ctx(slack_team_id: str, slack_user_id: str):
 
 def _approval_key(slack_team_id: str, channel_id: str, message_ts: str) -> str:
     return f"{slack_team_id}:{channel_id}:{message_ts}"
+
+
+async def _store_pending_approval(
+    *,
+    user_id: int,
+    action_id: str,
+    tool: str,
+    args: dict[str, Any],
+    summary: str,
+) -> str:
+    if tool not in APPROVAL_TOOL_ALLOWLIST:
+        raise ValueError(f"tool {tool!r} is not approval-eligible")
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(minutes=_APPROVAL_REQUEST_TTL_MINUTES)
+    session_maker = session_factory()
+    async with session_maker() as session:
+        session.add(
+            ApprovalRequest(
+                token=token,
+                user_id=user_id,
+                action_id=action_id,
+                tool_name=tool,
+                args_json=json.dumps(args, default=str),
+                summary=summary[:300],
+                expires_at=expires_at,
+            )
+        )
+        await session.commit()
+    return token
+
+
+async def _load_pending_approval(
+    *, token: str, action_id: str, user_id: int
+) -> dict[str, Any] | None:
+    if not token:
+        return None
+    session_maker = session_factory()
+    async with session_maker() as session:
+        row = (
+            await session.exec(
+                select(ApprovalRequest).where(ApprovalRequest.token == token)
+            )
+        ).first()
+        if row is None:
+            return None
+        expires_at = row.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if row.status != "pending" or expires_at < datetime.now(UTC):
+            return None
+        if row.user_id != user_id or row.action_id != action_id:
+            return None
+        try:
+            args = json.loads(row.args_json)
+        except json.JSONDecodeError:
+            return None
+        return {
+            "token": row.token,
+            "tool": row.tool_name,
+            "args": args if isinstance(args, dict) else {},
+            "summary": row.summary,
+        }
+
+
+async def _mark_request_status(token: str, status: str) -> None:
+    if not token:
+        return
+    session_maker = session_factory()
+    async with session_maker() as session:
+        row = (
+            await session.exec(
+                select(ApprovalRequest).where(ApprovalRequest.token == token)
+            )
+        ).first()
+        if row is None:
+            return
+        row.status = status
+        row.updated_at = datetime.now(UTC)
+        session.add(row)
+        await session.commit()
 
 
 def _is_approval_key_conflict(exc: IntegrityError) -> bool:
@@ -312,14 +432,10 @@ async def _handle_approve_click(body, client) -> None:
     try:
         action = body["actions"][0]
         payload = json.loads(action["value"])
+        approval_token = str(payload.get("approval_token") or "")
     except Exception as exc:
         logger.warning(f"approve: bad payload: {exc}")
         return
-
-    tool_name = payload.get("tool")
-    payload_summary = payload.get("summary") or ""
-    args = dict(payload.get("args") or {})
-    args["confirmed"] = True
 
     slack_user_id = body["user"]["id"]
     slack_team_id = (
@@ -327,13 +443,54 @@ async def _handle_approve_click(body, client) -> None:
     )
     channel_id = body["channel"]["id"]
     message_ts = body["message"]["ts"]
+    thread_ts = body.get("message", {}).get("thread_ts") or message_ts
     approval_key = _approval_key(slack_team_id, channel_id, message_ts)
 
+    ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
+    if ctx is None:
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text="⚠️ Could not look up your account; please re-run the request.",
+            blocks=_settled_blocks(
+                "⚠️", "*Failed.* Could not look up your account; please re-run the request."
+            ),
+        )
+        return
+
+    pending = await _load_pending_approval(
+        token=approval_token,
+        action_id=action.get("action_id") or "",
+        user_id=ctx["user_id"],
+    )
+    if pending is None:
+        logger.warning(
+            f"approval rejected: invalid or expired token; "
+            f"clicker={slack_user_id} channel={channel_id} ts={message_ts}"
+        )
+        try:
+            await client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="⚠️ Approval expired — please re-run the request.",
+                blocks=_settled_blocks(
+                    "⚠️", "*Expired.* Please re-run the request."
+                ),
+            )
+        except SlackApiError as exc:
+            logger.warning(f"approve: expired-token chat_update failed: {exc}")
+        return
+
+    tool_name = pending["tool"]
+    payload_summary = pending.get("summary") or ""
+    args = dict(pending.get("args") or {})
+    args["confirmed"] = True
+
     # Allow-list guard: refuse to dispatch anything not on the known approved-tool
-    # list, no matter what the payload says. Logs the attempt for auditability.
+    # list, even though only server-created ApprovalRequest rows should reach here.
     if tool_name not in APPROVAL_TOOL_ALLOWLIST:
         logger.warning(
-            f"approval rejected: tool {tool_name!r} not in APPROVAL_TOOL_ALLOWLIST; "
+            f"approval rejected: stored tool {tool_name!r} not in APPROVAL_TOOL_ALLOWLIST; "
             f"clicker={slack_user_id} channel={channel_id} ts={message_ts}"
         )
         try:
@@ -347,18 +504,7 @@ async def _handle_approve_click(body, client) -> None:
             )
         except SlackApiError as exc:
             logger.warning(f"approve: rejection chat_update failed: {exc}")
-        return
-
-    ctx = await _resolve_user_ctx(slack_team_id, slack_user_id)
-    if ctx is None:
-        await client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            text="⚠️ Could not look up your account; please re-run the request.",
-            blocks=_settled_blocks(
-                "⚠️", "*Failed.* Could not look up your account; please re-run the request."
-            ),
-        )
+        await _mark_request_status(approval_token, "rejected")
         return
 
     try:
@@ -388,6 +534,7 @@ async def _handle_approve_click(body, client) -> None:
             f"approval ignored: already claimed key={approval_key} "
             f"clicker={slack_user_id}"
         )
+        await _mark_request_status(approval_token, "ignored")
         return
 
     try:
@@ -410,6 +557,8 @@ async def _handle_approve_click(body, client) -> None:
             workday_end=ctx["workday_end"],
             slack_user_id=slack_user_id,
             slack_bot_token=settings.slack_bot_token,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
         )
     except Exception as exc:
         logger.exception(f"approve: dispatch_tool({tool_name}) failed")
@@ -444,6 +593,36 @@ async def _handle_approve_click(body, client) -> None:
         "succeeded" if isinstance(result, dict) and result.get("ok") else "failed",
         error=None if isinstance(result, dict) and result.get("ok") else summary,
     )
+    await _mark_request_status(
+        approval_token,
+        "succeeded" if isinstance(result, dict) and result.get("ok") else "failed",
+    )
+
+    # A successful Google Ads pull (KPI report or analyst answer) makes this
+    # thread an Ads Q&A thread — persist the account so follow-up questions in
+    # the thread don't have to re-specify it. This is also what lets a `/kpi`
+    # run flow into conversational follow-ups in the same thread.
+    if (
+        tool_name in _ADS_STICKY_TOOLS
+        and isinstance(result, dict)
+        and result.get("ok")
+    ):
+        ads_customer_id = normalize_customer_id(args.get("customer_id"))
+        if ads_customer_id:
+            try:
+                await session_store.save_command_state(
+                    user_id=ctx["user_id"],
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    command_name=_ADS_QA_SESSION,
+                    state={
+                        "customer_id": ads_customer_id,
+                        "account_name": str(args.get("account_name") or ""),
+                    },
+                    ttl_minutes=24 * 60,
+                )
+            except Exception as exc:
+                logger.warning(f"ads_qa sticky state write failed: {exc}")
 
     # Large read-tool payloads (e.g. the /kpi report) post as their own message
     # so the card itself stays a compact one-line confirmation.
@@ -471,7 +650,6 @@ async def _handle_approve_click(body, client) -> None:
 
     # Best-effort: record the settled outcome into thread history so the next
     # agent turn ("do that again for next week") has context.
-    thread_ts = body.get("message", {}).get("thread_ts") or message_ts
     try:
         await session_store.append_settled_action(
             user_id=ctx["user_id"],

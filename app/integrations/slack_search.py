@@ -16,6 +16,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from app.db import tokens as token_repo
 from app.db.engine import session_scope
+from app.utils.cache import TTLCache
 
 REPLY_REACTIONS = {"white_check_mark", "+1", "thumbsup", "eyes", "ok_hand", "pray"}
 
@@ -49,32 +50,22 @@ def _ts_to_dt(ts: str) -> datetime:
     return datetime.fromtimestamp(float(ts), tz=__import__("datetime").timezone.utc)
 
 
-async def find_unreplied_mentions(
-    *,
-    user_id: int,
-    slack_user_id: str,
-    days: int = 7,
-    bot_token: str,
-    max_results: int = 50,
-) -> list[UnrepliedMention]:
-    """Return mentions of `slack_user_id` in the last `days` days the user hasn't replied to.
+# The bot's own identity is immutable for the life of its token — resolve it
+# once and reuse instead of two Slack API calls every /goodmorning.
+_BOT_IDENTITY_CACHE: TTLCache[str, tuple[str, str, str]] = TTLCache(
+    maxsize=4, ttl_seconds=3600
+)
 
-    Reply heuristic: REPLIED if any of:
-      - User posted any message in that thread
-      - User reacted to the message (subset of reactions count as ack)
-      - User authored the mention themselves (skip)
-    """
-    user_token = await _user_token(user_id)
-    user_client = AsyncWebClient(token=user_token)
-    bot_client = AsyncWebClient(token=bot_token)
 
-    # Resolve bot identity. We collect three signals because Slack's
-    # search.messages returns app-posted messages with inconsistent shape:
-    # sometimes `bot_id` is set, sometimes only `username`, sometimes `user`
-    # is the bot's user_id. We filter aggressively on all three.
-    bot_user_id = ""
-    bot_id = ""
-    bot_display_name = ""
+async def _resolve_bot_identity(
+    bot_client: AsyncWebClient, bot_token: str
+) -> tuple[str, str, str]:
+    """Return (bot_user_id, bot_id, bot_display_name), cached per token."""
+    cached = _BOT_IDENTITY_CACHE.get(bot_token)
+    if cached is not None:
+        return cached
+
+    bot_user_id = bot_id = bot_display_name = ""
     try:
         auth = await bot_client.auth_test()
         bot_user_id = auth.get("user_id") or ""
@@ -96,8 +87,41 @@ async def find_unreplied_mentions(
         except SlackApiError:
             pass
 
+    identity = (bot_user_id, bot_id, bot_display_name)
+    if bot_user_id:  # only cache a real resolution, not a transient failure
+        _BOT_IDENTITY_CACHE.set(bot_token, identity)
+    return identity
+
+
+async def find_unreplied_mentions(
+    *,
+    user_id: int,
+    slack_user_id: str,
+    days: int = 7,
+    bot_token: str,
+    max_results: int = 50,
+) -> list[UnrepliedMention]:
+    """Return mentions of `slack_user_id` in the last `days` days the user hasn't replied to.
+
+    Reply heuristic: REPLIED if any of:
+      - User posted any message in that thread
+      - User reacted to the message (subset of reactions count as ack)
+      - User authored the mention themselves (skip)
+    """
+    user_token = await _user_token(user_id)
+    user_client = AsyncWebClient(token=user_token)
+    bot_client = AsyncWebClient(token=bot_token)
+
+    # Resolve bot identity (cached per token). search.messages returns
+    # app-posted messages with inconsistent shape — sometimes `bot_id`, sometimes
+    # only `username`, sometimes `user` is the bot's id — so we filter on all
+    # three signals.
+    bot_user_id, bot_id, bot_display_name = await _resolve_bot_identity(
+        bot_client, bot_token
+    )
     logger.info(
-        f"bot identity for filter: user_id={bot_user_id!r} bot_id={bot_id!r} name={bot_display_name!r}"
+        f"bot identity for filter: user_id={bot_user_id!r} bot_id={bot_id!r} "
+        f"name={bot_display_name!r}"
     )
 
     after = (

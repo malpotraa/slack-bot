@@ -140,6 +140,28 @@ class ApprovalExecution(SQLModel, table=True):
     __table_args__ = ({"sqlite_autoincrement": True},)
 
 
+class ApprovalRequest(SQLModel, table=True):
+    """Server-side payload for one approval button.
+
+    Slack button values carry only the random token. The executable tool args
+    stay in this table so they are not exposed to Slack clients.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    token: str = Field(unique=True, index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    action_id: str = Field(index=True)
+    tool_name: str = Field(index=True)
+    args_json: str
+    summary: str = ""
+    status: str = "pending"
+    created_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_type=_TS)
+    expires_at: datetime = Field(sa_type=_TS)
+
+    __table_args__ = ({"sqlite_autoincrement": True},)
+
+
 class WorkflowStatusCache(SQLModel, table=True):
     """Cache of Wrike custom-status name → id per (user, workflow). Refreshed on demand."""
 

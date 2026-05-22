@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -12,17 +11,15 @@ from sqlmodel import select
 
 from app.db.engine import session_scope
 from app.db.models import ConversationSession
+from app.utils.cache import KeyedLocks
 
-_HISTORY_LOCKS: dict[tuple[int, str, str], asyncio.Lock] = {}
+# One asyncio.Lock per (user, channel, thread); the backing dict is bounded —
+# unheld locks are pruned once it fills.
+_HISTORY_LOCKS = KeyedLocks(maxsize=512)
 
 
-def _history_lock(user_id: int, channel_id: str, thread_ts: str) -> asyncio.Lock:
-    key = (user_id, channel_id, thread_ts)
-    lock = _HISTORY_LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _HISTORY_LOCKS[key] = lock
-    return lock
+def _history_lock(user_id: int, channel_id: str, thread_ts: str):
+    return _HISTORY_LOCKS.get((user_id, channel_id, thread_ts))
 
 
 async def _find(
@@ -113,10 +110,12 @@ async def append_agent_turn(
     thread_ts: str,
     user_msg: str,
     assistant_msg: str,
-    keep_recent_turns: int = 6,
-    summarize_when_more_than: int = 12,
+    keep_recent_turns: int = 4,
+    summarize_when_more_than: int = 8,
 ) -> None:
-    """Append (user, assistant) and roll older history into a summary if it gets long."""
+    """Append (user, assistant) and roll older history into a summary if it gets
+    long. Compacts sooner (>8 turns, keeping 4 verbatim) to cap the history
+    re-sent on every turn — the rolling summary preserves identifiers."""
     async with _history_lock(user_id, channel_id, thread_ts):
         await _append_agent_turn_locked(
             user_id=user_id,

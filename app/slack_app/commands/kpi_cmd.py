@@ -132,7 +132,12 @@ def register(app):
             "✅ Account lookup complete. Review the KPI request below.",
         )
         if len(matches) == 1:
-            blocks = _approval_blocks_for_account(matches[0], parsed["mode"], parsed["account_query"])
+            blocks = await _approval_blocks_for_account(
+                matches[0],
+                parsed["mode"],
+                parsed["account_query"],
+                user_id=user_id,  # type: ignore[arg-type]
+            )
             await client.chat_postMessage(
                 channel=target_channel,
                 thread_ts=thread_ts,
@@ -167,7 +172,20 @@ def register(app):
 
         channel_id = body["channel"]["id"]
         message_ts = body["message"]["ts"]
-        blocks = _approval_blocks_for_account(account, mode, query)
+        slack_team_id = (
+            body.get("team", {}).get("id") or body.get("user", {}).get("team_id") or ""
+        )
+        slack_user_id = body.get("user", {}).get("id") or ""
+        async with session_scope() as session:
+            user = await get_or_create_user(
+                session, slack_team_id=slack_team_id, slack_user_id=slack_user_id
+            )
+            user_id = user.id
+        if user_id is None:
+            return
+        blocks = await _approval_blocks_for_account(
+            account, mode, query, user_id=user_id
+        )
         await client.chat_update(
             channel=channel_id,
             ts=message_ts,
@@ -194,8 +212,8 @@ def _parse_command(text: str) -> dict[str, Any]:
     return {"provider": KPI_PROVIDER, "account_query": account_query, "mode": mode}
 
 
-def _approval_blocks_for_account(
-    account: google_ads.GoogleAdsAccount, mode: str, account_query: str
+async def _approval_blocks_for_account(
+    account: google_ads.GoogleAdsAccount, mode: str, account_query: str, *, user_id: int
 ) -> list[dict]:
     windows = google_ads.compute_windows(account.time_zone)
     metric_name = "ROAS" if mode == "roas" else "Cost / conv."
@@ -222,7 +240,7 @@ def _approval_blocks_for_account(
         "_Active campaign means currently enabled under the configured MCC._"
     )
 
-    return build_approval_blocks(
+    return await build_approval_blocks(
         [
             {
                 "tool": "fetch_google_ads_kpis",
@@ -236,6 +254,7 @@ def _approval_blocks_for_account(
                 "summary": summary,
             }
         ],
+        user_id=user_id,
         primary_button_text="✅ Pull KPI",
         cancel_button_text="❌ Cancel",
     )

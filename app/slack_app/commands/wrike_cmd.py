@@ -494,7 +494,8 @@ async def _handle_thread_turn(
 
     if not overlapping:
         # Clean slot — single approval card
-        blocks = build_approval_blocks_with_alternates(
+        blocks = await build_approval_blocks_with_alternates(
+            user_id=user_id,
             primary=_action_for(proposed_start, proposed_end, proposed_summary),
         )
         await client.chat_postMessage(
@@ -543,7 +544,8 @@ async def _handle_thread_turn(
             f"(no overlap). Marks Wrike task as *Accepted & Scheduled*.",
         )
 
-    blocks = build_approval_blocks_with_alternates(
+    blocks = await build_approval_blocks_with_alternates(
+        user_id=user_id,
         intro_text=intro,
         primary=primary_action,
         alternate=alt_action,

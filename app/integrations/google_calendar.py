@@ -21,6 +21,10 @@ class CalendarNotConnectedError(RuntimeError):
     pass
 
 
+# Bounded by user count in practice; the cap is a safety net so a long-lived
+# process can't accumulate entries without limit. On overflow both caches are
+# cleared together (they're cross-linked) and rebuild lazily.
+_MAX_CACHED_USERS = 200
 _CREDENTIALS_CACHE: dict[int, Credentials] = {}
 _SERVICE_CACHE: dict[int, Any] = {}
 
@@ -80,6 +84,9 @@ async def _credentials_for(user_id: int) -> Credentials:
     # a silent token refresh builds a fresh Credentials object and the old
     # _SERVICE_CACHE entry (keyed by the old object's id) would leak forever.
     invalidate_user_cache(user_id)
+    if len(_CREDENTIALS_CACHE) >= _MAX_CACHED_USERS:
+        _CREDENTIALS_CACHE.clear()
+        _SERVICE_CACHE.clear()
     _CREDENTIALS_CACHE[user_id] = creds
     return creds
 

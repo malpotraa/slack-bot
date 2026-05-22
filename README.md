@@ -259,7 +259,7 @@ All runtime configuration is environment-driven. Cloud Run injects values from S
 | `PHOENIX_COLLECTOR_ENDPOINT` | — | `https://app.phoenix.arize.com/s/<space>` for Phoenix Cloud |
 | `PHOENIX_API_KEY` | — | Empty for self-host; set for Phoenix Cloud |
 | `PHOENIX_PROJECT_NAME` | — | Default `slack-assistant` |
-| `TRACE_SENSITIVE_DATA` | — | Default `false`; set `true` only for approved tracing sinks |
+| `TRACE_SENSITIVE_DATA` | — | Default `false`: prompts, tool names/args and replies traced in full; tool *responses* traced as shape + types only (values masked). `true`: everything raw + Anthropic auto-instrumentation |
 | `APP_ENV` | — | `prod` |
 | `LOG_LEVEL` | — | `INFO` |
 

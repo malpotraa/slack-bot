@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
 from datetime import UTC, datetime
 from html import escape
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from loguru import logger
 from slack_sdk.web.async_client import AsyncWebClient
@@ -25,6 +27,9 @@ from app.slack_app.connection_status import status_for
 
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _GENERIC_CONNECT_ERROR = "Connection failed. Please return to Slack and run /connect again."
+_OAUTH_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_OAUTH_RATE_LIMIT_MAX_ATTEMPTS = 30
+_OAUTH_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[float]] = {}
 
 
 def _track_background_task(task: asyncio.Task) -> None:
@@ -187,7 +192,7 @@ def _success_page(provider: str) -> HTMLResponse:
     )
 
 
-def _error_page(provider: str, message: str) -> HTMLResponse:
+def _error_page(provider: str, message: str, *, status_code: int = 400) -> HTMLResponse:
     provider_html = escape(provider)
     message_html = escape(message)
     return HTMLResponse(
@@ -199,7 +204,56 @@ def _error_page(provider: str, message: str) -> HTMLResponse:
         </head><body><h1>⚠️ {provider_html} connect failed</h1>
         <p>{message_html}</p><p>Run <code>/connect</code> in Slack to try again.</p>
         </body></html>""",
-        status_code=400,
+        status_code=status_code,
+    )
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip() or "unknown"
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _oauth_rate_limited(request: Request) -> bool:
+    """Small in-process guard for public OAuth callback endpoints.
+
+    This prevents cheap callback spam from turning into provider token-exchange
+    traffic. It is intentionally local only; Cloud Run is pinned to one instance
+    for Socket Mode.
+    """
+    now = time.monotonic()
+    key = (_client_ip(request), request.url.path)
+    bucket = _OAUTH_RATE_LIMIT_BUCKETS.get(key)
+    if bucket is None:
+        bucket = deque()
+        _OAUTH_RATE_LIMIT_BUCKETS[key] = bucket
+    cutoff = now - _OAUTH_RATE_LIMIT_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= _OAUTH_RATE_LIMIT_MAX_ATTEMPTS:
+        return True
+    bucket.append(now)
+
+    # Bound memory if random IPs spray the endpoint.
+    if len(_OAUTH_RATE_LIMIT_BUCKETS) > 2048:
+        stale = [
+            k
+            for k, q in _OAUTH_RATE_LIMIT_BUCKETS.items()
+            if not q or q[-1] < cutoff
+        ]
+        for k in stale:
+            _OAUTH_RATE_LIMIT_BUCKETS.pop(k, None)
+    return False
+
+
+def _rate_limit_page(provider: str) -> HTMLResponse:
+    return _error_page(
+        provider,
+        "Too many connection attempts. Wait a minute, then try again from Slack.",
+        status_code=429,
     )
 
 
@@ -218,10 +272,13 @@ def create_oauth_app() -> FastAPI:
 
     @app.get("/oauth/google/callback")
     async def google_callback(
+        request: Request,
         code: str | None = Query(default=None),
         state: str | None = Query(default=None),
         error: str | None = Query(default=None),
     ) -> HTMLResponse:
+        if _oauth_rate_limited(request):
+            return _rate_limit_page("Google")
         if error:
             return _error_page("Google", f"Google returned error: {error}")
         if not code or not state:
@@ -270,10 +327,13 @@ def create_oauth_app() -> FastAPI:
 
     @app.get("/oauth/google-ads/callback")
     async def google_ads_callback(
+        request: Request,
         code: str | None = Query(default=None),
         state: str | None = Query(default=None),
         error: str | None = Query(default=None),
     ) -> HTMLResponse:
+        if _oauth_rate_limited(request):
+            return _rate_limit_page("Google Ads")
         if error:
             return _error_page("Google Ads", f"Google returned error: {error}")
         if not code or not state:
@@ -322,10 +382,13 @@ def create_oauth_app() -> FastAPI:
 
     @app.get("/oauth/wrike/callback")
     async def wrike_callback(
+        request: Request,
         code: str | None = Query(default=None),
         state: str | None = Query(default=None),
         error: str | None = Query(default=None),
     ) -> HTMLResponse:
+        if _oauth_rate_limited(request):
+            return _rate_limit_page("Wrike")
         if error:
             return _error_page("Wrike", f"Wrike returned error: {error}")
         if not code or not state:
@@ -368,10 +431,13 @@ def create_oauth_app() -> FastAPI:
 
     @app.get("/oauth/slack/callback")
     async def slack_callback(
+        request: Request,
         code: str | None = Query(default=None),
         state: str | None = Query(default=None),
         error: str | None = Query(default=None),
     ) -> HTMLResponse:
+        if _oauth_rate_limited(request):
+            return _rate_limit_page("Slack")
         if error:
             return _error_page("Slack", f"Slack returned error: {error}")
         if not code or not state:

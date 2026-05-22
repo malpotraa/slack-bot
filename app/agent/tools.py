@@ -16,16 +16,22 @@ Two-phase approval:
 
 from __future__ import annotations
 
+import asyncio
 import re as _re
 from datetime import datetime, timedelta
 from typing import Any
 
 from dateutil import parser as dateparser
+from loguru import logger
 
 from app.integrations import google_calendar as gcal
 from app.integrations import google_ads
+from app.integrations import google_ads_drill
+from app.integrations import google_ads_snapshot
 from app.integrations import slack_search
 from app.integrations import wrike as wrike_int
+from app.formatters import ads_blocks
+from app.formatters import ads_charts
 from app.formatters import kpi_blocks
 from app.llm.kpi_summary import explain_kpi_report
 from app.utils.timezone import (
@@ -231,6 +237,127 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    # ─── Google Ads (read-only data) ───
+    {
+        "name": "get_google_ads_data",
+        "description": (
+            "Fetch Google Ads performance data for ONE ad account and post a "
+            "table and/or chart. READ-ONLY — never changes the account. Works "
+            "for every campaign type (Search, Shopping, Performance Max, "
+            "Demand Gen, Video, Display).\n"
+            "• Use scope='account_overview' for the first / surface question "
+            "about an account.\n"
+            "• Use a drill scope (campaign_detail, keywords, search_terms, "
+            "ad_groups, ads, products, asset_groups) with campaign_name or "
+            "campaign_id when the user digs into one campaign.\n"
+            "Pass customer_id when the thread context already names the "
+            "account, otherwise account_query. After it returns, narrate the "
+            "insight from the returned fact_pack in a few sentences — the "
+            "table and/or charts are posted to the user automatically."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["scope"],
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": [
+                        "account_overview",
+                        "campaign_detail",
+                        "keywords",
+                        "search_terms",
+                        "ad_groups",
+                        "ads",
+                        "products",
+                        "asset_groups",
+                    ],
+                    "description": (
+                        "account_overview = surface view of the whole account; "
+                        "the others drill into ONE campaign."
+                    ),
+                },
+                "customer_id": {
+                    "type": "string",
+                    "description": "10-digit Google Ads customer id, when known.",
+                },
+                "account_query": {
+                    "type": "string",
+                    "description": "Account name to search under the MCC, when customer_id is unknown.",
+                },
+                "campaign_id": {
+                    "type": "string",
+                    "description": "Campaign id to drill into (drill scopes).",
+                },
+                "campaign_name": {
+                    "type": "string",
+                    "description": (
+                        "Campaign name to drill into — resolved against the "
+                        "account's campaigns. Use this when you only know the "
+                        "name the user said."
+                    ),
+                },
+                "metric": {
+                    "type": "string",
+                    "enum": ["cost_per_conv", "roas"],
+                    "description": (
+                        "Headline metric for the table. Default cost_per_conv. "
+                        "Pass 'roas' ONLY when the user explicitly asks about "
+                        "ROAS / return on ad spend."
+                    ),
+                },
+                "include_charts": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. Set true ONLY when the user explicitly "
+                        "asks for a chart or graph."
+                    ),
+                },
+                "chart_metrics": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "cost",
+                            "conversions",
+                            "clicks",
+                            "impressions",
+                            "cost_per_conv",
+                            "cpc",
+                            "conv_rate",
+                            "ctr",
+                        ],
+                    },
+                    "description": "Metrics to chart when include_charts is true.",
+                },
+                "chart_days": {
+                    "type": "integer",
+                    "description": (
+                        "Lookback in days for charts (e.g. 7, 30, 90). Default 30."
+                    ),
+                },
+                "include_change": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. Set true ONLY when the user asks for "
+                        "percent-change / deltas IN THE TABLE."
+                    ),
+                },
+                "extras": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["wow", "yoy", "day_of_week", "90d"],
+                    },
+                    "description": (
+                        "Optional digest slices. Default empty. Add values "
+                        "ONLY when explicitly asked: wow=week-over-week, "
+                        "yoy=year-over-year/last year, day_of_week=weekday "
+                        "patterns, 90d=90-day/quarter/long-term trend."
+                    ),
+                },
+            },
+        },
+    },
     # ─── Internal: drives /wrike approval-button card ───
     {
         "name": "schedule_wrike_task",
@@ -331,6 +458,8 @@ async def dispatch_tool(
     workday_end: str,
     slack_user_id: str | None = None,
     slack_bot_token: str | None = None,
+    channel_id: str = "",
+    thread_ts: str = "",
 ) -> Any:
     if name == "list_calendar_events":
         return await _list_calendar_events(inputs, user_id=user_id, tz_name=user_tz)
@@ -364,6 +493,13 @@ async def dispatch_tool(
         )
     if name == "fetch_google_ads_kpis":
         return await _fetch_google_ads_kpis(inputs, user_id=user_id)
+    if name == "get_google_ads_data":
+        return await _get_google_ads_data(
+            inputs,
+            user_id=user_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
     if name == "update_working_hours":
         return await _update_working_hours(inputs, user_id=user_id)
     if name == "get_working_hours":
@@ -926,6 +1062,10 @@ async def _fetch_google_ads_kpis(inputs: dict, *, user_id: int) -> dict:
         mode=mode,
         frozen_windows=inputs.get("windows"),
     )
+    # KPI rows + deltas are deterministic. The per-campaign notes are
+    # model-written but constrained: explain_kpi_report hands the model a
+    # fully-precomputed fact pack and drops any note whose figures don't
+    # reconcile against it — so a bad note degrades to the plain rows.
     explanations = await explain_kpi_report(report)
     blocks = kpi_blocks.report_blocks(report, explanations)
     account = report.get("account") or {}
@@ -935,6 +1075,826 @@ async def _fetch_google_ads_kpis(inputs: dict, *, user_id: int) -> dict:
         "settled_label": "Pulled",
         "blocks": blocks,
     }
+
+
+# ── Google Ads analyst (read-only data) ────────────────────────────────────
+
+
+_DRILL_SCOPES = {
+    "campaign_detail",
+    "keywords",
+    "search_terms",
+    "ad_groups",
+    "ads",
+    "products",
+    "asset_groups",
+}
+
+_ADS_EXTRA_SLICES = {"wow", "yoy", "day_of_week", "90d"}
+
+
+async def _resolve_ads_account(
+    client: google_ads.GoogleAdsClient, *, customer_id: str, account_query: str
+):
+    """Resolve to a GoogleAdsAccount, or return a dict the agent relays
+    (an error, or a needs_disambiguation list)."""
+    if customer_id:
+        account = await client.account_by_id(customer_id)
+        if account is None:
+            return {
+                "error": (
+                    f"Customer id {customer_id} isn't an enabled account "
+                    "under the configured MCC."
+                ),
+                "next_action": "Ask the user which Google Ads account they mean.",
+            }
+        return account
+    if account_query:
+        try:
+            matches = await client.search_accounts(account_query)
+        except Exception as exc:
+            return {"error": f"Google Ads account search failed: {exc}"}
+        if not matches:
+            return {
+                "error": (
+                    "No enabled Google Ads account under the configured MCC "
+                    f"matched '{account_query}'."
+                )
+            }
+        if len(matches) > 1:
+            return {
+                "needs_disambiguation": True,
+                "candidates": [
+                    {"customer_id": m.customer_id, "name": m.name}
+                    for m in matches[:10]
+                ],
+                "next_action": (
+                    "List these accounts as a numbered list and ask which "
+                    "one, then call get_google_ads_data again with that "
+                    "customer_id."
+                ),
+            }
+        return matches[0]
+    return {
+        "error": "No account specified.",
+        "next_action": "Ask the user which Google Ads account they mean.",
+    }
+
+
+_CHART_METRIC_LABELS = {
+    "cost": "Cost",
+    "conversions": "Conversions",
+    "clicks": "Clicks",
+    "impressions": "Impressions",
+    "cost_per_conv": "Cost/conv",
+    "cpc": "CPC",
+    "conv_rate": "Conv rate",
+    "ctr": "CTR",
+}
+
+
+def _daily_metric_value(day: dict, metric: str) -> float | None:
+    """Derive one metric for a single day of the trend series."""
+    cost = day.get("cost") or 0
+    conv = day.get("conversions") or 0
+    clicks = day.get("clicks") or 0
+    impr = day.get("impressions") or 0
+    if metric == "cost":
+        return cost
+    if metric == "conversions":
+        return conv
+    if metric == "clicks":
+        return clicks
+    if metric == "impressions":
+        return impr
+    if metric == "cost_per_conv":
+        return round(cost / conv, 2) if conv else None
+    if metric == "cpc":
+        return round(cost / clicks, 2) if clicks else None
+    if metric == "conv_rate":
+        return round(conv / clicks, 4) if clicks else None
+    if metric == "ctr":
+        return round(clicks / impr, 4) if impr else None
+    return None
+
+
+def _overview_chart_specs(
+    snapshot: dict, chart_metrics: list[str], chart_days: int
+) -> list[dict]:
+    """Line charts of the requested daily metrics over the last N days. Built
+    only when the user explicitly asked for a chart."""
+    trend = snapshot.get("daily_trend_90d") or []
+    if not trend:
+        return []
+    window = trend[-chart_days:] if chart_days > 0 else trend
+    x = [str(d.get("date") or "")[5:] for d in window]
+    metrics = [m for m in chart_metrics if m in _CHART_METRIC_LABELS] or ["cost"]
+    specs: list[dict] = []
+    for metric in metrics:
+        label = _CHART_METRIC_LABELS[metric]
+        specs.append(
+            {
+                "kind": "line",
+                "title": f"{label} — last {len(window)} days",
+                "filename": f"{metric}_trend.png",
+                "x": x,
+                "y": [_daily_metric_value(d, metric) for d in window],
+                "y_label": label,
+            }
+        )
+    return specs
+
+
+def _campaign_chart_specs(
+    snapshot: dict, campaign: dict, chart_metrics: list[str], chart_days: int
+) -> list[dict]:
+    """Line charts of ONE campaign's daily metrics over the last N days."""
+    series = (snapshot.get("daily_by_campaign") or {}).get(
+        str(campaign.get("campaign_id"))
+    ) or []
+    if not series:
+        return []
+    window = series[-chart_days:] if chart_days > 0 else series
+    x = [str(d.get("date") or "")[5:] for d in window]
+    metrics = [m for m in chart_metrics if m in _CHART_METRIC_LABELS] or ["cost"]
+    name = campaign.get("name") or "Campaign"
+    specs: list[dict] = []
+    for metric in metrics:
+        label = _CHART_METRIC_LABELS[metric]
+        specs.append(
+            {
+                "kind": "line",
+                "title": f"{name} — {label}, last {len(window)} days",
+                "filename": f"campaign_{metric}_trend.png",
+                "x": x,
+                "y": [_daily_metric_value(d, metric) for d in window],
+                "y_label": label,
+            }
+        )
+    return specs
+
+
+def _row_metric_value(row: dict, metric: str) -> Any:
+    """Read an already-derived metric off a drill row (`cpa` is cost_per_conv)."""
+    return row.get("cpa") if metric == "cost_per_conv" else row.get(metric)
+
+
+_BAR_VALUE_KINDS = {
+    "cost": "money",
+    "cpc": "money",
+    "cost_per_conv": "money",
+    "conv_rate": "percent",
+    "ctr": "percent",
+}
+
+
+def _drill_chart_specs(drill: dict, chart_metrics: list[str]) -> list[dict]:
+    """A bar of the first drill dimension, ranked by the requested metric."""
+    account = drill.get("account") or {}
+    currency = ads_blocks.currency_symbol(account.get("currency"))
+    metric = next(
+        (m for m in chart_metrics if m in _CHART_METRIC_LABELS), "cost"
+    )
+    value_kind = _BAR_VALUE_KINDS.get(metric, "number")
+    for dimension, payload in (drill.get("breakdown") or {}).items():
+        rows = payload.get("rows") or []
+        if not rows:
+            continue
+        top = sorted(
+            rows, key=lambda r: -(_row_metric_value(r, metric) or 0)
+        )[:10]
+        return [
+            {
+                "kind": "bar",
+                "title": (
+                    f"Top {dimension.replace('_', ' ')} by "
+                    f"{_CHART_METRIC_LABELS[metric].lower()}"
+                ),
+                "filename": f"{dimension}_{metric}.png",
+                "labels": [r.get("label") or "" for r in top],
+                "values": [_row_metric_value(r, metric) or 0 for r in top],
+                "value_kind": value_kind,
+                "currency": currency if value_kind == "money" else "",
+            }
+        ]
+    return []
+
+
+# Cap concurrent matplotlib renders — each figure is a transient memory spike.
+_CHART_SEMAPHORE = asyncio.Semaphore(2)
+
+
+async def _render_specs(specs: list[dict]) -> list[dict]:
+    """Render chart PNGs off the event loop (matplotlib is blocking CPU work),
+    capped so concurrent renders can't spike memory."""
+    if not specs:
+        return []
+    try:
+        async with _CHART_SEMAPHORE:
+            return await asyncio.to_thread(ads_charts.render_charts, specs)
+    except Exception as exc:
+        logger.warning(f"Google Ads chart render failed: {exc}")
+        return []
+
+
+# ── Slim, labeled fact pack for the model ──────────────────────────────────
+#
+# The full snapshot / drill drives the deterministic tables + charts. The model
+# only NARRATES, so it gets a trimmed, labeled digest — no 90-day daily series,
+# no unused per-campaign windows, no positional column counting.
+
+
+def _slim_metrics(m: dict, use_roas: bool) -> dict:
+    """Keep the metrics the narration uses; drop conversion value (and ROAS
+    unless the user asked for it). `cpa` is surfaced as `cost_per_conv`."""
+    if not m:
+        return {}
+    out = {
+        k: m.get(k)
+        for k in (
+            "cost",
+            "conversions",
+            "clicks",
+            "impressions",
+            "cpc",
+            "conv_rate",
+            "ctr",
+        )
+    }
+    out["cost_per_conv"] = m.get("cpa")
+    if use_roas:
+        out["roas"] = m.get("roas")
+    return out
+
+
+def _slim_deltas(d: dict, use_roas: bool) -> dict:
+    """Keep only deltas the narration is allowed to use."""
+    if not d:
+        return {}
+    out = {
+        "cost_pct": d.get("cost_pct"),
+        "conversions_pct": d.get("conversions_pct"),
+        "clicks_pct": d.get("clicks_pct"),
+        "impressions_pct": d.get("impressions_pct"),
+        "cpc_pct": d.get("cpc_pct"),
+        "conv_rate_pct": d.get("conv_rate_pct"),
+        "ctr_pct": d.get("ctr_pct"),
+    }
+    if use_roas:
+        out["roas_pct"] = d.get("roas_pct")
+    else:
+        out["cost_per_conv_pct"] = d.get("cpa_pct")
+    return out
+
+
+def _campaign_digest_row(c: dict, use_roas: bool) -> dict:
+    m = c.get("last_30") or {}
+    d = c.get("delta_30d_vs_prior_30") or {}
+    budget = c.get("budget") or {}
+    share = c.get("impression_share") or {}
+    row = {
+        "name": c.get("name"),
+        "channel": c.get("channel"),
+        "status": c.get("status"),
+        "cost": m.get("cost"),
+        "conversions": m.get("conversions"),
+        "clicks": m.get("clicks"),
+        "impressions": m.get("impressions"),
+        "cpc": m.get("cpc"),
+        "conv_rate": m.get("conv_rate"),
+        "ctr": m.get("ctr"),
+        **_slim_deltas(d, use_roas),
+        "budget_pacing_pct": budget.get("pacing_pct"),
+        "budget_limited": budget.get("budget_limited"),
+        "lost_is_budget": share.get("lost_is_budget"),
+        "lost_is_rank": share.get("lost_is_rank"),
+    }
+    if use_roas:
+        row["roas"] = m.get("roas")
+    else:
+        row["cost_per_conv"] = m.get("cpa")
+    return row
+
+
+def _daily_metric_series(days: list[dict], metric: str) -> list[float | None]:
+    return [_daily_metric_value(day, metric) for day in days]
+
+
+def _period_average(values: list[float | None]) -> float | None:
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return None
+    return round(sum(nums) / len(nums), 4)
+
+
+def _campaign_trend_summary(
+    snapshot: dict, campaign: dict, metric: str, chart_days: int
+) -> dict | None:
+    """Small deterministic trend summary for one campaign chart request.
+
+    The raw daily series stays tool-internal; the model gets only enough
+    labeled facts to narrate direction without inventing from the chart.
+    """
+    series = (snapshot.get("daily_by_campaign") or {}).get(
+        str(campaign.get("campaign_id"))
+    ) or []
+    if not series:
+        return None
+    window = series[-chart_days:] if chart_days > 0 else series
+    values = _daily_metric_series(window, metric)
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+
+    midpoint = max(1, len(window) // 2)
+    earlier_avg = _period_average(values[:midpoint])
+    recent_avg = _period_average(values[midpoint:])
+    change_pct = google_ads_snapshot.pct_change(recent_avg, earlier_avg)
+    if change_pct is None:
+        direction = "flat"
+    elif change_pct > 2:
+        direction = "up"
+    elif change_pct < -2:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    return {
+        "campaign_name": campaign.get("name"),
+        "metric": metric,
+        "days": len(window),
+        "start": window[0].get("date"),
+        "end": window[-1].get("date"),
+        "first_value": values[0],
+        "last_value": values[-1],
+        "min_value": min(valid),
+        "max_value": max(valid),
+        "earlier_avg": earlier_avg,
+        "recent_avg": recent_avg,
+        "recent_vs_earlier_pct": change_pct,
+        "direction": direction,
+    }
+
+
+def _daily_trend_summary(
+    days: list[dict], metric: str, *, max_days: int = 90
+) -> dict | None:
+    """Deterministic summary of a raw daily trend, without sending raw rows."""
+    window = days[-max_days:] if max_days > 0 else days
+    if not window:
+        return None
+    values = _daily_metric_series(window, metric)
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+
+    midpoint = max(1, len(window) // 2)
+    earlier_avg = _period_average(values[:midpoint])
+    recent_avg = _period_average(values[midpoint:])
+    change_pct = google_ads_snapshot.pct_change(recent_avg, earlier_avg)
+    if change_pct is None:
+        direction = "flat"
+    elif change_pct > 2:
+        direction = "up"
+    elif change_pct < -2:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    return {
+        "metric": metric,
+        "days": len(window),
+        "start": window[0].get("date"),
+        "end": window[-1].get("date"),
+        "first_value": values[0],
+        "last_value": values[-1],
+        "min_value": min(valid),
+        "max_value": max(valid),
+        "earlier_avg": earlier_avg,
+        "recent_avg": recent_avg,
+        "recent_vs_earlier_pct": change_pct,
+        "direction": direction,
+    }
+
+
+def _account_90d_summary(snapshot: dict, use_roas: bool) -> dict:
+    trend = snapshot.get("daily_trend_90d") or []
+    return _multi_metric_90d_summary(trend, use_roas)
+
+
+def _campaign_90d_summary(snapshot: dict, campaign: dict, use_roas: bool) -> dict:
+    trend = (snapshot.get("daily_by_campaign") or {}).get(
+        str(campaign.get("campaign_id"))
+    ) or []
+    return _multi_metric_90d_summary(trend, use_roas)
+
+
+def _multi_metric_90d_summary(days: list[dict], use_roas: bool) -> dict:
+    metrics = ["cost", "conversions", "cpc", "conv_rate", "ctr"]
+    if not use_roas:
+        metrics.insert(2, "cost_per_conv")
+    return {
+        metric: summary
+        for metric in metrics
+        if (summary := _daily_trend_summary(days, metric)) is not None
+    }
+
+
+def _add_digest_extras(
+    out: dict, snapshot: dict, *, extras: set[str], use_roas: bool
+) -> None:
+    totals = snapshot.get("account_totals") or {}
+    deltas = snapshot.get("account_deltas") or {}
+    if "wow" in extras:
+        out.setdefault("account_totals", {})["last_7"] = _slim_metrics(
+            totals.get("last_7") or {}, use_roas
+        )
+        out.setdefault("account_deltas", {})["wow_7d"] = _slim_deltas(
+            deltas.get("wow_7d") or {}, use_roas
+        )
+    if "yoy" in extras:
+        out.setdefault("account_deltas", {})["yoy_30d"] = _slim_deltas(
+            deltas.get("yoy_30d") or {}, use_roas
+        )
+    if "day_of_week" in extras:
+        out["day_of_week_avg"] = snapshot.get("day_of_week_avg")
+    if "90d" in extras:
+        out["trend_90d"] = _account_90d_summary(snapshot, use_roas)
+
+
+def _add_campaign_extras(
+    out: dict,
+    snapshot: dict,
+    campaign: dict,
+    *,
+    extras: set[str],
+    use_roas: bool,
+) -> None:
+    c = out.setdefault("campaign", {})
+    if "wow" in extras:
+        last_7 = campaign.get("last_7") or {}
+        prior_7 = campaign.get("prior_7") or {}
+        c["last_7"] = _slim_metrics(last_7, use_roas)
+        c["delta_7d_vs_prior_7"] = _slim_deltas(
+            google_ads_snapshot.deltas(last_7, prior_7), use_roas
+        )
+    if "yoy" in extras:
+        c["delta_30d_vs_yoy"] = _slim_deltas(
+            google_ads_snapshot.deltas(
+                campaign.get("last_30") or {},
+                campaign.get("yoy_last_30") or {},
+            ),
+            use_roas,
+        )
+    if "day_of_week" in extras:
+        series = (snapshot.get("daily_by_campaign") or {}).get(
+            str(campaign.get("campaign_id"))
+        ) or []
+        c["day_of_week_avg"] = google_ads_snapshot.day_of_week_summary(series)
+    if "90d" in extras:
+        c["trend_90d"] = _campaign_90d_summary(snapshot, campaign, use_roas)
+
+
+def _overview_digest(
+    snapshot: dict,
+    metric: str,
+    *,
+    selected_campaign: dict | None = None,
+    trend_metric: str | None = None,
+    chart_days: int = 30,
+    extras: set[str] | None = None,
+) -> dict:
+    """Slim, model-facing view of an account snapshot."""
+    use_roas = metric == "roas"
+    account = snapshot.get("account") or {}
+    window = (snapshot.get("windows") or {}).get("last_30") or {}
+    totals = snapshot.get("account_totals") or {}
+    requested_extras = extras or set()
+
+    base = {
+        "account": {
+            "name": account.get("name"),
+            "customer_id": account.get("customer_id"),
+            "currency": account.get("currency"),
+        },
+        "period": {
+            "label": "last 30 days",
+            "start": window.get("start"),
+            "end": window.get("end"),
+            "as_of": snapshot.get("as_of"),
+        },
+    }
+
+    if selected_campaign:
+        out = {
+            **base,
+            "kind": "selected_campaign",
+            "campaign": _campaign_digest_row(selected_campaign, use_roas),
+        }
+        if trend_metric:
+            out["campaign_trend"] = _campaign_trend_summary(
+                snapshot, selected_campaign, trend_metric, chart_days
+            )
+        _add_campaign_extras(
+            out,
+            snapshot,
+            selected_campaign,
+            extras=requested_extras,
+            use_roas=use_roas,
+        )
+        return out
+
+    source_campaigns = list(snapshot.get("campaigns") or [])
+    digest_campaigns = source_campaigns[:8]
+
+    campaigns = [_campaign_digest_row(c, use_roas) for c in digest_campaigns]
+
+    by_channel = {
+        channel: {
+            "campaign_count": agg.get("campaign_count"),
+            "last_30": _slim_metrics(agg.get("last_30") or {}, use_roas),
+            "delta_30d_vs_prior_30": _slim_deltas(
+                agg.get("delta_30d_vs_prior_30") or {}, use_roas
+            ),
+        }
+        for channel, agg in (snapshot.get("by_channel") or {}).items()
+    }
+
+    out = {
+        **base,
+        "kind": "account_overview",
+        "account_totals": {"last_30": _slim_metrics(totals.get("last_30") or {}, use_roas)},
+        "account_deltas": {
+            "mom_30d": _slim_deltas(
+                (snapshot.get("account_deltas") or {}).get("mom_30d") or {},
+                use_roas,
+            )
+        },
+        "by_channel": by_channel,
+        "campaign_count": snapshot.get("campaign_count"),
+        "campaigns": campaigns,
+        "other_campaigns": snapshot.get("other_campaigns"),
+    }
+    _add_digest_extras(out, snapshot, extras=requested_extras, use_roas=use_roas)
+    return out
+
+
+def _drill_digest(drill: dict, metric: str) -> dict:
+    """Slim, model-facing view of a campaign drill-down."""
+    use_roas = metric == "roas"
+    account = drill.get("account") or {}
+    campaign = drill.get("campaign") or {}
+
+    breakdown: dict[str, Any] = {}
+    for dim, payload in (drill.get("breakdown") or {}).items():
+        if payload.get("error"):
+            breakdown[dim] = {"error": payload["error"]}
+            continue
+        rows = []
+        for r in (payload.get("rows") or [])[:15]:
+            row = {
+                "label": r.get("label"),
+                "cost": r.get("cost"),
+                "conversions": r.get("conversions"),
+                "cpc": r.get("cpc"),
+                "conv_rate": r.get("conv_rate"),
+                "ctr": r.get("ctr"),
+            }
+            if use_roas:
+                row["roas"] = r.get("roas")
+            else:
+                row["cost_per_conv"] = r.get("cpa")
+            rows.append(row)
+        breakdown[dim] = rows
+
+    return {
+        "account": {"name": account.get("name"), "currency": account.get("currency")},
+        "campaign": {
+            "name": campaign.get("name"),
+            "channel": campaign.get("channel"),
+            "status": campaign.get("status"),
+            "last_30": _slim_metrics(campaign.get("last_30") or {}, use_roas),
+            "delta_30d_vs_prior_30": campaign.get("delta_30d_vs_prior_30"),
+        },
+        "window": drill.get("window"),
+        "breakdown": breakdown,
+    }
+
+
+async def _get_google_ads_data(
+    inputs: dict, *, user_id: int, channel_id: str, thread_ts: str
+) -> dict:
+    """Read-only Google Ads data pull. scope='account_overview' returns the
+    surface snapshot; the drill scopes return a channel-aware campaign
+    breakdown. Returns the fact pack for the agent to narrate plus ready-made
+    table/chart output for the caller to post in-thread.
+    """
+    scope = (inputs.get("scope") or "account_overview").strip()
+    customer_id = google_ads.normalize_customer_id(inputs.get("customer_id"))
+    account_query = (inputs.get("account_query") or "").strip()
+    campaign_id = str(inputs.get("campaign_id") or "").strip()
+    campaign_name = (inputs.get("campaign_name") or "").strip()
+    metric = "roas" if inputs.get("metric") == "roas" else "cost_per_conv"
+    include_charts = bool(inputs.get("include_charts"))
+    include_change = bool(inputs.get("include_change"))
+    raw_extras = inputs.get("extras")
+    extras = {
+        str(item)
+        for item in raw_extras
+        if str(item) in _ADS_EXTRA_SLICES
+    } if isinstance(raw_extras, list) else set()
+    chart_metrics = inputs.get("chart_metrics")
+    if not isinstance(chart_metrics, list):
+        chart_metrics = []
+    try:
+        chart_days = max(1, min(int(inputs.get("chart_days") or 30), 90))
+    except (TypeError, ValueError):
+        chart_days = 30
+
+    try:
+        client = await google_ads.GoogleAdsClient.for_user(user_id)
+    except google_ads.GoogleAdsNotConnectedError:
+        return {"error": "Google Ads isn't connected. Run /connect to link it."}
+    except google_ads.GoogleAdsConfigError as exc:
+        return {"error": f"Google Ads isn't configured: {exc}"}
+
+    resolved = await _resolve_ads_account(
+        client, customer_id=customer_id, account_query=account_query
+    )
+    if isinstance(resolved, dict):
+        return resolved  # error or needs_disambiguation — the agent relays it
+    account = resolved
+
+    snap_key = (user_id, channel_id, thread_ts, account.customer_id)
+    try:
+        snapshot = await google_ads_snapshot.get_or_build_snapshot(
+            user_id=user_id, account=account, cache_key=snap_key
+        )
+    except google_ads.GoogleAdsNotConnectedError:
+        return {"error": "Google Ads isn't connected. Run /connect to link it."}
+    except Exception as exc:
+        logger.exception("Google Ads snapshot fetch failed")
+        return {"error": f"Couldn't pull Google Ads data: {exc}"}
+
+    # A campaign reference no longer forces a drill — only an explicit drill
+    # scope does. A metric / trend question about a campaign is answered from
+    # the account_overview digest (which carries every campaign's deltas).
+    is_drill = scope in _DRILL_SCOPES
+
+    if not is_drill:
+        images: list[dict] = []
+        selected_campaign: dict | None = None
+        chart_metric = next(
+            (m for m in chart_metrics if m in _CHART_METRIC_LABELS), None
+        )
+        if campaign_id or campaign_name:
+            resolved = google_ads_drill.resolve_campaign(
+                snapshot,
+                campaign_id=campaign_id or None,
+                campaign_name=campaign_name or None,
+            )
+            if isinstance(resolved, dict):
+                selected_campaign = resolved
+            elif isinstance(resolved, list):
+                return {
+                    "needs_disambiguation": True,
+                    "candidates": [{"name": c["name"]} for c in resolved[:10]],
+                    "next_action": (
+                        "List these campaigns and ask which one, then call "
+                        "get_google_ads_data again with that campaign_name."
+                    ),
+                }
+            else:
+                return {
+                    "error": f"I couldn't find that campaign in {account.name}.",
+                    "next_action": (
+                        "Ask which campaign name they mean, then call "
+                        "get_google_ads_data again with that campaign_name."
+                    ),
+                }
+        if include_charts:
+            specs = (
+                _campaign_chart_specs(
+                    snapshot, selected_campaign, chart_metrics, chart_days
+                )
+                if selected_campaign
+                else _overview_chart_specs(snapshot, chart_metrics, chart_days)
+            )
+            if selected_campaign and not specs:
+                return {
+                    "error": (
+                        f"I couldn't build a daily chart for "
+                        f"{selected_campaign.get('name') or 'that campaign'}."
+                    )
+                }
+            images = await _render_specs(specs)
+        blocks = (
+            None
+            if selected_campaign
+            else ads_blocks.account_overview_card(
+                snapshot, metric=metric, include_change=include_change
+            )
+        )
+        return {
+            "ok": True,
+            "kind": (
+                "campaign_chart"
+                if include_charts and selected_campaign
+                else "campaign_metric"
+                if selected_campaign
+                else "account_overview"
+            ),
+            "message": (
+                f"Google Ads chart — {selected_campaign.get('name')}."
+                if include_charts and selected_campaign
+                else f"Google Ads campaign — {selected_campaign.get('name')}."
+                if selected_campaign
+                else f"Google Ads overview — {account.name}."
+            ),
+            "fact_pack": _overview_digest(
+                snapshot,
+                metric,
+                selected_campaign=selected_campaign,
+                trend_metric=chart_metric,
+                chart_days=chart_days,
+                extras=extras,
+            ),
+            "blocks": blocks,
+            "images": images,
+            "_resolved_customer_id": account.customer_id,
+            "_resolved_account_name": account.name,
+            "_resolved_campaign_name": (
+                selected_campaign.get("name") if selected_campaign else None
+            ),
+        }
+
+    # Drill into one campaign.
+    campaign = google_ads_drill.resolve_campaign(
+        snapshot,
+        campaign_id=campaign_id or None,
+        campaign_name=campaign_name or None,
+    )
+    if campaign is None:
+        return {
+            "error": f"I couldn't find that campaign in {account.name}.",
+            "next_action": (
+                "Ask which campaign, or call get_google_ads_data with "
+                "scope='account_overview' to list them."
+            ),
+        }
+    if isinstance(campaign, list):
+        return {
+            "needs_disambiguation": True,
+            "candidates": [
+                {"campaign_id": c["campaign_id"], "name": c["name"]}
+                for c in campaign[:10]
+            ],
+            "next_action": (
+                "List these campaigns and ask which one, then call "
+                "get_google_ads_data again with that campaign_id."
+            ),
+        }
+
+    dimensions, scope_note = google_ads_drill.dimensions_for(
+        campaign.get("channel"), scope
+    )
+    drill_key = (
+        user_id,
+        channel_id,
+        thread_ts,
+        account.customer_id,
+        campaign["campaign_id"],
+        tuple(sorted(dimensions)),
+    )
+    try:
+        drill = await google_ads_drill.get_or_build_drill(
+            client=client,
+            account=account,
+            campaign=campaign,
+            dimensions=dimensions,
+            cache_key=drill_key,
+        )
+    except Exception as exc:
+        logger.exception("Google Ads drill fetch failed")
+        return {"error": f"Couldn't pull the campaign breakdown: {exc}"}
+
+    result: dict = {
+        "ok": True,
+        "kind": "campaign_detail",
+        "message": f"Google Ads drill-down — {campaign.get('name')}.",
+        "fact_pack": _drill_digest(drill, metric),
+        "blocks": ads_blocks.campaign_detail_card(drill, metric=metric),
+        "images": (
+            await _render_specs(_drill_chart_specs(drill, chart_metrics))
+            if include_charts
+            else []
+        ),
+        "_resolved_customer_id": account.customer_id,
+        "_resolved_account_name": account.name,
+    }
+    if scope_note:
+        result["scope_note"] = scope_note
+    return result
 
 
 # ── /wrike scheduler (event + status update) ───────────────────────────────

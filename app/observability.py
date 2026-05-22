@@ -112,3 +112,84 @@ def start_span(
     if attributes:
         merged.update(attributes)
     return get_tracer().start_as_current_span(name, attributes=merged)
+
+
+def redact_values(obj: Any) -> Any:
+    """Return a same-shaped copy of `obj` with every leaf value replaced by a
+    type token (`<str:11>`, `<int>`, `<float>`, `<bool>`).
+
+    Dict keys and list structure are preserved, so a trace shows the *shape*
+    and types of a tool response — useful for observability and evals — without
+    exposing the actual values (spend, campaign names, event titles, etc.).
+    Lists collapse to the first element's shape plus a count.
+    """
+    if obj is None:
+        return None
+    # bool is a subclass of int — check it first.
+    if isinstance(obj, bool):
+        return "<bool>"
+    if isinstance(obj, int):
+        return "<int>"
+    if isinstance(obj, float):
+        return "<float>"
+    if isinstance(obj, str):
+        return f"<str:{len(obj)}>"
+    if isinstance(obj, dict):
+        return {str(k): redact_values(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        if not obj:
+            return []
+        head = redact_values(obj[0])
+        if len(obj) == 1:
+            return [head]
+        return [head, f"<+{len(obj) - 1} more items>"]
+    return f"<{type(obj).__name__}>"
+
+
+# ── Cost estimation ────────────────────────────────────────────────────────
+
+# Per-million-token USD rates. `cache_write` uses the 1-hour-cache rate (2x the
+# input rate) since the agent caches its static prefix with a 1h TTL.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-sonnet-4-6": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.30,
+        "cache_write": 6.0,
+    },
+    "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.10,
+        "cache_write": 2.0,
+    },
+}
+
+
+def estimate_cost_usd(
+    model: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    """Estimate the USD cost of one model turn from its token usage.
+
+    Returns 0.0 for an unrecognised model. `input_tokens` is the *uncached*
+    input — Anthropic reports cache reads/writes as separate counts.
+    """
+    rates: dict[str, float] | None = None
+    for prefix, table in MODEL_PRICING.items():
+        if model.startswith(prefix):
+            rates = table
+            break
+    if rates is None:
+        return 0.0
+    total = (
+        input_tokens * rates["input"]
+        + output_tokens * rates["output"]
+        + cache_read_tokens * rates["cache_read"]
+        + cache_write_tokens * rates["cache_write"]
+    )
+    return round(total / 1_000_000, 6)

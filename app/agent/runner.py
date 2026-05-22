@@ -15,7 +15,6 @@ Phoenix tracing remains rich: per-turn span, per-tool span, full input/output.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -25,16 +24,24 @@ from openinference.semconv.trace import OpenInferenceSpanKindValues as Kind
 from openinference.semconv.trace import SpanAttributes
 from opentelemetry import trace
 
-from app.agent.prompts import ASSISTANT_SYSTEM_PROMPT, PROMPT_VERSION
+from app.agent.prompts import (
+    ASSISTANT_SYSTEM_PROMPT,
+    PROMPT_VERSION,
+    dynamic_context_block,
+)
 from app.agent.tools import TOOL_SCHEMAS, dispatch_tool
 from app.config import settings
 from app.integrations import google_calendar as gcal
-from app.observability import start_span
+from app.observability import estimate_cost_usd, redact_values, start_span
+from app.utils.cache import TTLCache
 from app.utils.timezone import fmt_local_range, now_in
 
 _anthropic: AsyncAnthropic | None = None
-_PREFETCH_TTL_SECONDS = 180
-_PREFETCH_CACHE: dict[tuple[int, str, str], tuple[float, str | None]] = {}
+# Upcoming-events prefetch: caches "" for a negative result (no events / fetch
+# failed) so a real None return still means cache miss.
+_PREFETCH_CACHE: TTLCache[tuple[int, str, str], str] = TTLCache(
+    maxsize=256, ttl_seconds=180
+)
 
 
 def _client() -> AsyncAnthropic:
@@ -55,7 +62,7 @@ def _tools_with_caching() -> list[dict[str, Any]]:
     if not TOOL_SCHEMAS:
         return []
     tools = [dict(t) for t in TOOL_SCHEMAS]
-    tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}}
     return tools
 
 
@@ -82,8 +89,39 @@ def _set_session_attrs(
     span.set_attribute("slack.thread_ts", thread_ts)
 
 
-def _trace_payload(value: str, *, redacted: str = "[redacted]") -> str:
-    return value if settings.trace_sensitive_data else redacted
+def _trace_tool_output(result: Any) -> str:
+    """Tool outputs (Calendar / Wrike / Google Ads responses) are the bulk
+    integration data. By default we trace only their SHAPE — keys, types, list
+    counts — so traces stay eval-useful without exposing real values. Set
+    TRACE_SENSITIVE_DATA=true to trace the raw output instead.
+    """
+    payload = result if settings.trace_sensitive_data else redact_values(result)
+    return json.dumps(payload, default=str)[:8000]
+
+
+def _set_usage_attrs(
+    span,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_create_tokens: int,
+) -> None:
+    """Record aggregate token counts and estimated cost for an agent turn."""
+    span.set_attribute("llm.token_count.prompt_total", input_tokens)
+    span.set_attribute("llm.token_count.completion_total", output_tokens)
+    span.set_attribute("llm.token_count.cache_read_total", cache_read_tokens)
+    span.set_attribute("llm.token_count.cache_create_total", cache_create_tokens)
+    span.set_attribute(
+        "llm.cost_usd",
+        estimate_cost_usd(
+            settings.agent_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_create_tokens,
+        ),
+    )
 
 
 StreamCallback = Callable[[str], Awaitable[None]]
@@ -105,9 +143,8 @@ async def _prefetch_upcoming_events_context(
 
     cache_key = (user_id, channel_id, thread_ts)
     cached = _PREFETCH_CACHE.get(cache_key)
-    now_mono = time.monotonic()
-    if cached and now_mono - cached[0] < _PREFETCH_TTL_SECONDS:
-        return cached[1]
+    if cached is not None:
+        return cached or None  # "" = cached negative result
 
     try:
         now = now_in(tz_name)
@@ -115,7 +152,7 @@ async def _prefetch_upcoming_events_context(
             user_id, time_min=now, time_max=now + timedelta(hours=8)
         )
     except Exception:
-        _PREFETCH_CACHE[cache_key] = (now_mono, None)
+        _PREFETCH_CACHE.set(cache_key, "")
         return None
 
     lines: list[str] = []
@@ -132,14 +169,14 @@ async def _prefetch_upcoming_events_context(
             break
 
     if not lines:
-        _PREFETCH_CACHE[cache_key] = (now_mono, None)
+        _PREFETCH_CACHE.set(cache_key, "")
         return None
     result = (
         "[Upcoming events (next 8h, may be stale by a few minutes):\n"
         + "\n".join(lines)
         + "\nUse list_calendar_events for longer ranges or precise lookups.]"
     )
-    _PREFETCH_CACHE[cache_key] = (now_mono, result)
+    _PREFETCH_CACHE.set(cache_key, result)
     return result
 
 
@@ -188,11 +225,18 @@ async def run_agent_turn(
     thread_ts: str = "",
     max_tool_iterations: int = 4,
     on_stream_chunk: StreamCallback | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+    on_tool_start: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     """Run one user turn through Claude with streaming + prompt caching.
 
     `on_stream_chunk(accumulated_text)` is invoked on every text delta. The
     caller is responsible for debouncing chat.update calls — we don't here.
+
+    Returns `(reply_text, pending_actions, tool_messages)`:
+      • pending_actions — write/data-pull previews the caller turns into
+        approval cards.
+      • tool_messages — ready-to-post `{text, blocks}` messages (e.g. a
+        Google Ads answer served from the thread's cached snapshot).
     """
     now_local = now_in(user_tz)
     today_iso = now_local.date().isoformat()
@@ -200,22 +244,28 @@ async def run_agent_turn(
     now_local_str = (
         now_local.strftime("%-I:%M%p").replace("AM", "am").replace("PM", "pm")
     )
-    system_text = ASSISTANT_SYSTEM_PROMPT.format(
-        user_name=user_name,
-        tz=user_tz,
-        today_iso=today_iso,
-        weekday=weekday,
-        now_local=now_local_str,
-        work_start=workday_start,
-        work_end=workday_end,
-        prompt_version=PROMPT_VERSION,
-    )
     system_blocks: list[dict[str, Any]] = [
+        # Static prompt — cached for an hour so follow-ups (which often land
+        # more than 5 minutes apart) still hit the cache.
         {
             "type": "text",
-            "text": system_text,
-            "cache_control": {"type": "ephemeral"},
-        }
+            "text": ASSISTANT_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+        # Per-turn context — small, uncached, so it never invalidates the
+        # cached static prompt above.
+        {
+            "type": "text",
+            "text": dynamic_context_block(
+                user_name=user_name,
+                weekday=weekday,
+                today_iso=today_iso,
+                now_local=now_local_str,
+                tz=user_tz,
+                work_start=workday_start,
+                work_end=workday_end,
+            ),
+        },
     ]
     # Per-turn extra context (e.g. "the user is in a /wrike thread, here are
     # the tasks they see"). Not cache-marked because it varies per turn.
@@ -263,7 +313,9 @@ async def run_agent_turn(
             channel_id=channel_id,
             thread_ts=thread_ts,
         )
-        span.set_attribute(SpanAttributes.INPUT_VALUE, _trace_payload(user_message))
+        # User prompt is traced in full — it's the conversation, not bulk
+        # integration data, and it's needed to make traces eval-useful.
+        span.set_attribute(SpanAttributes.INPUT_VALUE, user_message)
         span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
         span.set_attribute("agent.model", settings.agent_model)
         span.set_attribute("agent.prompt_version", PROMPT_VERSION)
@@ -273,6 +325,10 @@ async def run_agent_turn(
         # Tools that returned preview=True become pending_actions; the caller
         # builds an Approve / Disapprove card for each.
         pending_actions: list[dict[str, Any]] = []
+        # Tools that return a ready-to-post message (e.g. a Google Ads answer
+        # served from the thread's cached snapshot). The caller posts these
+        # in-thread; the raw Block Kit is kept out of the model's context.
+        tool_messages: list[dict[str, Any]] = []
         total_input_tokens = 0
         total_output_tokens = 0
         total_cache_read_tokens = 0
@@ -285,7 +341,7 @@ async def run_agent_turn(
                 accumulated_text = ""
                 async with _client().messages.stream(
                     model=settings.agent_model,
-                    max_tokens=2048,
+                    max_tokens=1200,
                     system=system_blocks,
                     tools=tools,
                     messages=messages,
@@ -336,24 +392,26 @@ async def run_agent_turn(
 
             if final.stop_reason != "tool_use" or not tool_uses:
                 final_text = "\n".join(p for p in text_parts if p).strip()
+                # The assistant's reply is traced in full — it's the response
+                # that went out to the user.
                 span.set_attribute(
-                    SpanAttributes.OUTPUT_VALUE,
-                    _trace_payload(final_text or "(empty)"),
+                    SpanAttributes.OUTPUT_VALUE, final_text or "(empty)"
                 )
                 span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "text/plain")
                 span.set_attribute("agent.iterations", iteration + 1)
                 span.set_attribute("agent.tools_used", json.dumps(tools_used))
-                span.set_attribute("llm.token_count.prompt_total", total_input_tokens)
-                span.set_attribute(
-                    "llm.token_count.completion_total", total_output_tokens
+                _set_usage_attrs(
+                    span,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cache_read_tokens=total_cache_read_tokens,
+                    cache_create_tokens=total_cache_create_tokens,
                 )
-                span.set_attribute(
-                    "llm.token_count.cache_read_total", total_cache_read_tokens
+                return (
+                    final_text or "(no response)",
+                    pending_actions,
+                    tool_messages,
                 )
-                span.set_attribute(
-                    "llm.token_count.cache_create_total", total_cache_create_tokens
-                )
-                return (final_text or "(no response)", pending_actions)
 
             # Tool-use round — execute tools and continue
             tool_results = []
@@ -361,8 +419,14 @@ async def run_agent_turn(
                 tool_name = tu["name"]
                 tool_input = tu.get("input", {})
                 tools_used.append(tool_name)
-                tool_input_json = json.dumps(tool_input)[:8000]
-                traced_tool_input = _trace_payload(tool_input_json)
+                if on_tool_start is not None:
+                    try:
+                        await on_tool_start(tool_name)
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning(f"tool-start callback failed: {exc}")
+                # Tool input (the agent's call args) is traced in full — it's
+                # the agent's decision, not bulk integration data.
+                traced_tool_input = json.dumps(tool_input)[:8000]
                 with start_span(
                     f"tool.{tool_name}",
                     kind=Kind.TOOL,
@@ -394,36 +458,88 @@ async def run_agent_turn(
                             workday_end=workday_end,
                             slack_user_id=slack_user_id,
                             slack_bot_token=slack_bot_token,
+                            channel_id=channel_id,
+                            thread_ts=thread_ts,
                         )
                     except Exception as exc:
                         logger.exception(f"tool {tool_name} failed")
                         result = {"error": str(exc)}
                         ts.set_status(trace.StatusCode.ERROR, str(exc))
                         is_error = True
-                    tool_output_json = json.dumps(result, default=str)[:8000]
-                    traced_tool_output = _trace_payload(tool_output_json)
-                    ts.set_attribute("tool.output", traced_tool_output)
-                    ts.set_attribute(SpanAttributes.OUTPUT_VALUE, traced_tool_output)
-                    ts.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "application/json")
+                    # `model_result` is what we ship back to the model. For
+                    # tools that emit a ready-to-post message we strip the raw
+                    # Block Kit so it doesn't bloat the model's context.
+                    model_result = result
                     if isinstance(result, dict) and result.get("preview"):
                         ts.set_attribute("tool.is_preview", True)
                         # Capture for the handler to build an Approve card.
-                        # Pass the LLM's original args plus the summary text.
+                        # `_canonical_args` (when present) freezes resolved
+                        # ids so the confirmed call needs no re-resolution.
                         pending_actions.append(
                             {
                                 "tool": tool_name,
-                                "args": tool_input,
+                                "args": result.get("_canonical_args") or tool_input,
                                 "summary": result.get("summary_for_user", ""),
                                 "resolved_task_id": result.get("_resolved_task_id"),
+                                "resolved_customer_id": result.get(
+                                    "_resolved_customer_id"
+                                ),
+                                "resolved_account_name": result.get(
+                                    "_resolved_account_name"
+                                ),
                                 "alternate": result.get("alternate"),
                             }
                         )
+                    elif (
+                        isinstance(result, dict)
+                        and result.get("ok")
+                        and result.get("_resolved_customer_id")
+                    ):
+                        posts_message = bool(result.get("blocks") or result.get("images"))
+                        if posts_message:
+                            ts.set_attribute("tool.posts_message", True)
+                        tool_messages.append(
+                            {
+                                "text": result.get("message")
+                                or "Here's the result.",
+                                "blocks": result.get("blocks"),
+                                "images": result.get("images"),
+                                "resolved_customer_id": result.get(
+                                    "_resolved_customer_id"
+                                ),
+                                "resolved_account_name": result.get(
+                                    "_resolved_account_name"
+                                ),
+                                "resolved_campaign_name": result.get(
+                                    "_resolved_campaign_name"
+                                ),
+                            }
+                        )
+                        # Block Kit and raw PNG bytes never go back to the
+                        # model — only the fact pack it needs to narrate.
+                        model_result = {
+                            k: v
+                            for k, v in result.items()
+                            if k not in ("blocks", "images")
+                        }
+                        if posts_message:
+                            model_result["output_posted_to_user"] = True
+
+                    # Tool output is the bulk integration data — traced as
+                    # shape + types only (values masked) unless the operator
+                    # opts into TRACE_SENSITIVE_DATA.
+                    traced_tool_output = _trace_tool_output(model_result)
+                    ts.set_attribute("tool.output", traced_tool_output)
+                    ts.set_attribute(SpanAttributes.OUTPUT_VALUE, traced_tool_output)
+                    ts.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "application/json")
 
                 tool_results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": tu["id"],
-                        "content": json.dumps(result, default=str),
+                        "content": json.dumps(
+                            model_result, default=str, separators=(",", ":")
+                        ),
                         "is_error": is_error,
                     }
                 )
@@ -432,7 +548,16 @@ async def run_agent_turn(
         # Hit the iteration cap
         span.set_attribute("agent.iterations", max_tool_iterations)
         span.set_attribute("output.value", "(tool-iteration limit reached)")
+        span.set_attribute("agent.tools_used", json.dumps(tools_used))
+        _set_usage_attrs(
+            span,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cache_read_tokens=total_cache_read_tokens,
+            cache_create_tokens=total_cache_create_tokens,
+        )
         return (
             "I hit my tool-use limit before finishing — try asking again more specifically.",
             pending_actions,
+            tool_messages,
         )

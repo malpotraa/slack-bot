@@ -5,7 +5,6 @@ from __future__ import annotations
 import calendar
 import asyncio
 import re
-import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -18,6 +17,7 @@ from app.db import tokens as token_repo
 from app.db.engine import session_scope
 from app.oauth import google_ads as google_ads_oauth
 from app.oauth._logging import safe_error_summary
+from app.utils.cache import TTLCache
 from app.utils.http_client import shared_async_client
 
 
@@ -31,8 +31,9 @@ class GoogleAdsConfigError(RuntimeError):
 
 _CUSTOMER_ID_RE = re.compile(r"^\d{10,}$")
 _API_VERSION_RE = re.compile(r"^v\d+$")
-_ACCOUNT_CACHE_TTL_SECONDS = 300
-_ACCOUNT_CACHE: dict[tuple[int, str], tuple[float, list["GoogleAdsAccount"]]] = {}
+_ACCOUNT_CACHE: TTLCache[tuple[int, str], list["GoogleAdsAccount"]] = TTLCache(
+    maxsize=64, ttl_seconds=300
+)
 
 
 def normalize_customer_id(value: str | int | None) -> str:
@@ -179,9 +180,8 @@ class GoogleAdsClient:
     async def mcc_accounts(self) -> list[GoogleAdsAccount]:
         cache_key = (self._auth.user_id, self._auth.login_customer_id)
         cached = _ACCOUNT_CACHE.get(cache_key)
-        now = time.monotonic()
-        if cached and now - cached[0] < _ACCOUNT_CACHE_TTL_SECONDS:
-            return list(cached[1])
+        if cached is not None:
+            return list(cached)
 
         query = """
             SELECT
@@ -214,7 +214,7 @@ class GoogleAdsClient:
                     ),
                 )
             )
-        _ACCOUNT_CACHE[cache_key] = (now, list(accounts))
+        _ACCOUNT_CACHE.set(cache_key, list(accounts))
         return accounts
 
     async def search_accounts(self, query_text: str, *, limit: int = 25) -> list[GoogleAdsAccount]:
@@ -299,6 +299,61 @@ class GoogleAdsClient:
         """
         rows = await self.search_stream(customer_id, query)
         return [_keyword_row(row) for row in rows]
+
+    async def campaign_daily_metrics(
+        self, customer_id: str, window: DateWindow
+    ) -> list[dict[str, Any]]:
+        """Campaign x day metrics for a date range.
+
+        Unlike `campaign_metrics`, this does NOT filter on campaign status — a
+        campaign paused today but active during the window is still returned,
+        so trend/diagnostic analysis can see it. Current status comes back per
+        row for the caller to use.
+        """
+        query = f"""
+            SELECT
+              campaign.id,
+              campaign.name,
+              campaign.advertising_channel_type,
+              campaign.status,
+              segments.date,
+              metrics.cost_micros,
+              metrics.conversions,
+              metrics.conversions_value,
+              metrics.clicks,
+              metrics.impressions
+            FROM campaign
+            WHERE segments.date BETWEEN '{window.start.isoformat()}' AND '{window.end.isoformat()}'
+        """
+        rows = await self.search_stream(customer_id, query)
+        return [_campaign_daily_row(row) for row in rows]
+
+    async def campaign_impression_share(
+        self, customer_id: str, window: DateWindow
+    ) -> list[dict[str, Any]]:
+        """Per-campaign aggregate impression share + daily budget for a window.
+
+        Impression-share metrics are populated for Search campaigns only; they
+        come back absent (None) for other channel types.
+        """
+        query = f"""
+            SELECT
+              campaign.id,
+              campaign.name,
+              campaign.advertising_channel_type,
+              campaign.status,
+              campaign_budget.amount_micros,
+              metrics.cost_micros,
+              metrics.search_impression_share,
+              metrics.search_budget_lost_impression_share,
+              metrics.search_rank_lost_impression_share,
+              metrics.search_top_impression_share,
+              metrics.search_absolute_top_impression_share
+            FROM campaign
+            WHERE segments.date BETWEEN '{window.start.isoformat()}' AND '{window.end.isoformat()}'
+        """
+        rows = await self.search_stream(customer_id, query)
+        return [_impression_share_row(row) for row in rows]
 
 
 def compute_windows(time_zone: str, *, today: date | None = None) -> KpiWindows:
@@ -522,6 +577,60 @@ def _keyword_row(row: dict[str, Any]) -> dict[str, Any]:
         "clicks": int(_float(metrics.get("clicks"))),
         "impressions": int(_float(metrics.get("impressions"))),
     }
+
+
+def _campaign_daily_row(row: dict[str, Any]) -> dict[str, Any]:
+    campaign = row.get("campaign") or {}
+    segments = row.get("segments") or {}
+    metrics = row.get("metrics") or {}
+    return {
+        "campaign_id": str(campaign.get("id") or ""),
+        "name": str(campaign.get("name") or ""),
+        "channel": str(campaign.get("advertisingChannelType") or ""),
+        "status": str(campaign.get("status") or ""),
+        "date": str(segments.get("date") or ""),
+        "cost": _micros_to_units(metrics.get("costMicros")),
+        "conversions": _float(metrics.get("conversions")),
+        "conversion_value": _float(metrics.get("conversionsValue")),
+        "clicks": int(_float(metrics.get("clicks"))),
+        "impressions": int(_float(metrics.get("impressions"))),
+    }
+
+
+def _impression_share_row(row: dict[str, Any]) -> dict[str, Any]:
+    campaign = row.get("campaign") or {}
+    budget = row.get("campaignBudget") or {}
+    metrics = row.get("metrics") or {}
+    return {
+        "campaign_id": str(campaign.get("id") or ""),
+        "name": str(campaign.get("name") or ""),
+        "channel": str(campaign.get("advertisingChannelType") or ""),
+        "status": str(campaign.get("status") or ""),
+        "budget_amount": _micros_to_units(budget.get("amountMicros")),
+        "cost": _micros_to_units(metrics.get("costMicros")),
+        "search_impression_share": _opt_float(metrics.get("searchImpressionShare")),
+        "search_lost_is_budget": _opt_float(
+            metrics.get("searchBudgetLostImpressionShare")
+        ),
+        "search_lost_is_rank": _opt_float(
+            metrics.get("searchRankLostImpressionShare")
+        ),
+        "search_top_is": _opt_float(metrics.get("searchTopImpressionShare")),
+        "search_abs_top_is": _opt_float(
+            metrics.get("searchAbsoluteTopImpressionShare")
+        ),
+    }
+
+
+def _opt_float(value: Any) -> float | None:
+    """Like `_float`, but keeps None for absent values (e.g. impression-share
+    metrics that the API omits for non-Search campaigns)."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _with_metric(row: dict[str, Any], mode: str) -> dict[str, Any]:
