@@ -10,6 +10,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with a **Why & 
 
 ### Added
 
+- **Custom date ranges for the Google Ads analyst.** `get_google_ads_data` now accepts `date_from` + `date_to` (YYYY-MM-DD), so the agent can answer questions about specific calendar periods — "this month", "last month", "May 1–20", "21st to 30th" — without the user having to reframe them as rolling windows. The agent resolves the dates from the `TODAY` field in its context and passes them directly. Custom-range pulls use a separate 5-minute cache (keyed on the exact window) rather than the 20-minute rolling snapshot, so each distinct range is fetched independently. No period-over-period comparison is returned for custom ranges — the fact pack carries only the absolute metrics for the window, and the agent discloses this if the user asks for a delta.
+
+- **Braintrust observability + eval dataset.** Replaces Arize Phoenix. OTEL traces now export to `api.braintrust.dev` — same span hierarchy (agent.turn → agent.iteration → tool.*), same structural redaction policy (tool responses shape + types only unless `TRACE_SENSITIVE_DATA=true`). On top of traces, setting `EVAL_CAPTURE=true` inserts one row per successful Google Ads analyst turn into the `ads-analyst-turns` Braintrust dataset: the user message, the agent reply, the tool call args, and the *_pct delta fields from the fact_pack (absolute spend / campaign names are never stored externally). Four scorers ship in `app/evals/scorers.py`: factual accuracy (percentage mentions verified against the fact pack), no-recommendations rule (Haiku LLM-as-judge), metric compliance (no ROAS unless the user asked), and date-range mentioned. Run experiments offline with `uv run python -m app.evals.runner` to compare prompt versions across the captured dataset before deploying.
+
+### Changed
+
+- **Agent no longer re-labels rolling-window data as a calendar-month equivalent.** A prompt rule (2.7.0) prevents the model from framing "last 30 days (Apr 25–May 24)" as "May 1–24 equivalent" or similar fabricated labels. It now states the limitation clearly and offers the rolling window as-is. With 2.8.0 the rule is extended: the agent is instructed to use `date_from`/`date_to` for calendar periods instead of approximating them with rolling windows.
+- **Disambiguation turns are no longer captured as eval rows.** The eval capture hook now requires a non-empty `fact_pack` in the tool result, so turns where the tool returns `needs_disambiguation` (no data, just candidate account names) are silently skipped.
+
+- **`PHOENIX_*` env vars replaced by `BRAINTRUST_API_KEY` / `BRAINTRUST_PROJECT` / `EVAL_CAPTURE`.** Remove old Phoenix variables from Cloud Run secrets; add the Braintrust key.
+
+### Removed
+
+- **`arize-phoenix-otel` dependency** — replaced by the `braintrust` SDK. All other OpenTelemetry packages (`opentelemetry-api/sdk/exporter-otlp`, `openinference-*`) are retained unchanged.
+
+---
+
+
 - **Google Ads KPI command** via `/kpi google <account> [cpa|roas]`. The command searches only enabled non-manager accounts under the configured MCC, asks the user to disambiguate multiple matches, shows the exact frozen date ranges and scope, and then pulls the report only after the existing approve/deny card is approved.
 - **Google Ads OAuth provider** on `/connect`, using the `adwords` scope and encrypted per-user `GoogleAdsToken` storage. Google Ads is separate from Google Calendar so users explicitly consent to ad-performance access.
 - **Google Ads REST integration** using GAQL `searchStream` through the configured `GOOGLE_ADS_LOGIN_CUSTOMER_ID` MCC. KPI math is deterministic and computes CPA/ROAS from raw totals for last 7 days vs previous 7 days and month-to-date vs the same dates last month.

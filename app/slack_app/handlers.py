@@ -129,6 +129,8 @@ def _ads_thread_context(state: dict) -> str:
     name = state.get("account_name") or "the account"
     cid = state.get("customer_id") or ""
     campaign = state.get("last_campaign_name") or ""
+    focus_metric = state.get("last_focus_metric") or ""
+    focus_days = state.get("last_focus_days")
     campaign_note = (
         f" The most recent campaign discussed in this thread was "
         f"*{campaign}*; for follow-ups like \"graph it\" or \"trend\", pass "
@@ -136,13 +138,26 @@ def _ads_thread_context(state: dict) -> str:
         if campaign
         else ""
     )
+    focus_note = ""
+    if focus_metric:
+        days_note = (
+            f" and chart_days={int(focus_days)}"
+            if isinstance(focus_days, int) and focus_days > 0
+            else ""
+        )
+        focus_note = (
+            f" The most recent metric focus was {focus_metric!r}{days_note}; "
+            f"for follow-ups like \"chart it\" or \"graph it\", set "
+            f"include_charts=true and chart_metrics=[{focus_metric!r}]"
+            f"{days_note} unless the user names a different metric or range."
+        )
     return (
         f"[Google Ads thread context: this thread is already about the Google "
         f"Ads account *{name}* (customer_id {cid}). For any Google Ads "
         f"question in this thread, call get_google_ads_data with "
         f"customer_id={cid} — do NOT ask which account again. Only switch "
         f"accounts if the user explicitly names a different one."
-        f"{campaign_note}]"
+        f"{campaign_note}{focus_note}]"
     )
 
 
@@ -313,6 +328,16 @@ async def _save_ads_thread_state(
                 "customer_id": customer_id,
                 "account_name": tool_msg.get("resolved_account_name") or "",
                 "last_campaign_name": campaign_name,
+                "last_focus_metric": (
+                    tool_msg.get("focus_metric")
+                    or existing.get("last_focus_metric")
+                    or ""
+                ),
+                "last_focus_days": (
+                    tool_msg.get("focus_days")
+                    or existing.get("last_focus_days")
+                    or None
+                ),
             },
             ttl_minutes=24 * 60,
         )
@@ -399,12 +424,12 @@ async def _run_agent_reply(
             on_tool_start=on_tool_start,
         )
     except Exception:
-        # Full traceback is captured by Phoenix + Cloud Logging. The user-facing
+        # Full traceback is captured by Braintrust + Cloud Logging. The user-facing
         # message stays generic so we don't leak internals.
         logger.exception("agent turn failed")
         reply = (
             "⚠️ Something went wrong on my end. Try again in a moment — if it "
-            "keeps failing, check the Phoenix dashboard for the trace."
+            "keeps failing, check Braintrust for the trace."
         )
 
     # A tool already posted the substantive output (e.g. a Google Ads card) —

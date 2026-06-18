@@ -1,6 +1,6 @@
 # Pronto
 
-> Multi-user Slack-native AI assistant for Google Calendar, Google Ads, Wrike, and Slack — built on Claude (Anthropic), deployed on Google Cloud Run, observable through Arize Phoenix.
+> Multi-user Slack-native AI assistant for Google Calendar, Google Ads, Wrike, and Slack — built on Claude (Anthropic), deployed on Google Cloud Run, observable through Braintrust.
 
 [![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Runtime](https://img.shields.io/badge/runtime-Cloud%20Run-4285F4.svg)](https://cloud.google.com/run)
@@ -44,7 +44,7 @@ Talk to it in a Slack DM. It reads your calendar, Google Ads KPIs, Wrike tasks, 
 | **`/kpi google <account> [cpa\|roas]`** | Google Ads KPI report for one account under the configured MCC, with approval before pulling campaign and keyword-driver data. |
 | **Approval-gated writes** | Every write (create/update calendar event, change Wrike status, post Wrike comment) is two-phase: preview → user confirms → execute. |
 | **Restricted scope** | Hard boundaries enforced in code + system prompt. No deletes on Calendar. No task creates/deletes on Wrike. Slack is read-only. |
-| **Phoenix tracing** | Every conversation, tool call, and result captured as an OpenTelemetry trace with user attribution. |
+| **Braintrust tracing** | Every conversation, tool call, and result captured as an OpenTelemetry trace with user attribution. |
 
 ## Architecture
 
@@ -62,7 +62,7 @@ User browsers ─OAuth callback►│  in one container   │──► Wrike API
                               │  sessions, cache    │
                               └─────────────────────┘
                               ┌─────────────────────┐
-                              │  Phoenix Cloud      │◄── OTel HTTP exporter
+                              │  Braintrust         │◄── OTel HTTP exporter
                               └─────────────────────┘
                               ┌─────────────────────┐
                               │  Secret Manager     │ (injected as env vars)
@@ -87,7 +87,7 @@ User browsers ─OAuth callback►│  in one container   │──► Wrike API
 | LLM | Claude Sonnet 4.6 (agent) + Claude Haiku 4.5 (entity extraction) |
 | ORM | SQLModel (Pydantic + SQLAlchemy) |
 | DB driver | `asyncpg` (production) / `aiosqlite` (local dev) |
-| Observability | OpenTelemetry + OpenInference + Arize Phoenix |
+| Observability | OpenTelemetry + OpenInference + Braintrust |
 | Compute | Google Cloud Run (gen2) |
 | Database | Google Cloud SQL Postgres 15 |
 | Secrets | Google Secret Manager |
@@ -101,7 +101,7 @@ prod/
 ├── app/                              # Application code
 │   ├── main.py                       # Entrypoint — runs Bolt + FastAPI on one event loop
 │   ├── config.py                     # pydantic-settings; reads $PORT for Cloud Run
-│   ├── observability.py              # Phoenix / OTel setup
+│   ├── observability.py              # Braintrust / OTel setup
 │   ├── logging_setup.py              # loguru bridge for stdlib + uvicorn
 │   ├── db/                           # SQLModel tables, token crypto (Fernet), engine
 │   ├── oauth/                        # Google / Wrike / Slack OAuth flows + FastAPI callbacks
@@ -157,7 +157,7 @@ You'll need accounts and apps configured at:
 | **Google Cloud** project | Hosting + Calendar OAuth client | Pay as Use |
 | **Wrike** account (admin) | OAuth app for Wrike REST | Free trial |
 | **Anthropic** account | Claude API key | Pay-as-you-go |
-| **Arize Phoenix** Cloud | Trace ingestion (optional) | Free tier |
+| **Braintrust** | Trace ingestion and evals (optional) | Free tier |
 
 **Local CLI tools:**
 
@@ -256,9 +256,9 @@ All runtime configuration is environment-driven. Cloud Run injects values from S
 | `GOOGLE_ADS_API_VERSION` | — | Default `v22` |
 | `WRIKE_CLIENT_ID` | ✓ | From wrike.com/frame/oauth2/apps |
 | `WRIKE_CLIENT_SECRET` | ✓ | From wrike.com/frame/oauth2/apps |
-| `PHOENIX_COLLECTOR_ENDPOINT` | — | `https://app.phoenix.arize.com/s/<space>` for Phoenix Cloud |
-| `PHOENIX_API_KEY` | — | Empty for self-host; set for Phoenix Cloud |
-| `PHOENIX_PROJECT_NAME` | — | Default `slack-assistant` |
+| `BRAINTRUST_API_KEY` | — | Enables Braintrust OTLP trace export |
+| `BRAINTRUST_PROJECT` | — | Default `pronto-ads-analyst` |
+| `EVAL_CAPTURE` | — | Default `false`; when true, captures Google Ads analyst turns to the Braintrust eval dataset |
 | `TRACE_SENSITIVE_DATA` | — | Default `false`: prompts, tool names/args and replies traced in full; tool *responses* traced as shape + types only (values masked). `true`: everything raw + Anthropic auto-instrumentation |
 | `APP_ENV` | — | `prod` |
 | `LOG_LEVEL` | — | `INFO` |
@@ -348,7 +348,7 @@ These are codified in `cloudbuild.yaml`. Don't change them lightly.
 
 Every conversation, tool call, and DB operation is captured as an OpenTelemetry trace.
 
-**Phoenix dashboard**: `<your PHOENIX_COLLECTOR_ENDPOINT>` → project `slack-assistant`.
+**Braintrust dashboard**: project from `BRAINTRUST_PROJECT`.
 
 Span structure for a typical DM:
 
@@ -374,7 +374,7 @@ Recurring infra costs at idle, before Anthropic API usage:
 | Secret Manager (14 secrets) | first 6 free | ~$1 |
 | Cloud Build (120 build-min/day free) | — | $0 |
 | Artifact Registry (first 0.5 GB free) | — | $0 |
-| Phoenix Cloud (free tier) | — | $0 |
+| Braintrust (free tier) | — | $0 |
 | **Total infra** | | **~$22–27** |
 
 **Anthropic usage** is the variable cost — depends on how much your team uses the bot. With prompt caching, expect ~$0.10–0.50 per active user per day. A 10-person team running heavy use is ~$30–100/month of API.
@@ -408,11 +408,10 @@ cd ..                                   # the dev tree at repo root
 uv sync
 uv run python scripts/gen_keys.py       # generate local keys
 cp .env.example .env                    # fill in
-docker run -p 6006:6006 -p 4317:4317 arizephoenix/phoenix:latest &
 uv run python -m app.main
 ```
 
-The dev tree (`../app/`) is structurally identical to `prod/app/` but uses SQLite + local Phoenix. Changes you validate locally can be mirrored to `prod/` and deployed.
+The dev tree (`../app/`) is structurally identical to `prod/app/` but uses SQLite locally. Changes you validate locally can be mirrored to `prod/` and deployed.
 
 ## Troubleshooting
 
@@ -424,7 +423,7 @@ See `docs/Production_Deployment_Guide.docx` §15 for the full troubleshooting re
 | `/connect failed: app did not respond` | Bolt isn't connected to Socket Mode | Check logs for `⚡️ Bolt app is running!`; verify `SLACK_APP_TOKEN` and Socket Mode toggle in Slack app |
 | Container restarts mid-request | Default CPU throttling | Confirm `--no-cpu-throttling`, `--min-instances=1`, `--max-instances=1` |
 | OAuth `invalid_client` | Client ID env var is wrong / placeholder | Confirm `gcloud run services describe ... --format='value(...env)'` shows secret-sourced values, not literals |
-| Phoenix 401 | Wrong endpoint or API key | Check `PHOENIX_COLLECTOR_ENDPOINT` includes the `/s/<space>` if you're on multi-space Phoenix Cloud |
+| Braintrust traces missing | Missing or wrong API key | Check `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT` |
 | `/goodmorning` includes bot's own messages | Aggressive bot-message filter not loaded | Check logs for `bot identity for filter:` line; redeploy |
 | `/wrike` errors with `invalid_blocks` | Section overflow | Already fixed via `_section_chunks` — make sure latest is deployed |
 
@@ -461,7 +460,7 @@ Proprietary — internal Opensail tooling. All rights reserved.
 Built with:
 - [Anthropic Claude](https://www.anthropic.com/claude)
 - [slack-bolt](https://slack.dev/bolt-python/)
-- [Arize Phoenix](https://phoenix.arize.com)
+- [Braintrust](https://www.braintrust.dev/)
 - [uv](https://docs.astral.sh/uv/)
 
 ---

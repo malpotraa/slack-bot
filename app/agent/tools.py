@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import re as _re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from dateutil import parser as dateparser
@@ -353,6 +353,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "ONLY when explicitly asked: wow=week-over-week, "
                         "yoy=year-over-year/last year, day_of_week=weekday "
                         "patterns, 90d=90-day/quarter/long-term trend."
+                    ),
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "Custom range start date (YYYY-MM-DD). Use together "
+                        "with date_to when the user asks for a specific "
+                        "calendar period: 'this month', 'May 1–20', etc. "
+                        "Resolve the date from the TODAY field in context."
+                    ),
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "Custom range end date (YYYY-MM-DD, inclusive). "
+                        "Clamped to yesterday automatically. Use with date_from."
                     ),
                 },
             },
@@ -1093,6 +1109,16 @@ _DRILL_SCOPES = {
 _ADS_EXTRA_SLICES = {"wow", "yoy", "day_of_week", "90d"}
 
 
+def _parse_date_arg(val: Any) -> date | None:
+    """Parse a YYYY-MM-DD string from tool input. Returns None on failure."""
+    if not val:
+        return None
+    try:
+        return date.fromisoformat(str(val).strip())
+    except ValueError:
+        return None
+
+
 async def _resolve_ads_account(
     client: google_ads.GoogleAdsClient, *, customer_id: str, account_query: str
 ):
@@ -1380,11 +1406,40 @@ def _daily_metric_series(days: list[dict], metric: str) -> list[float | None]:
     return [_daily_metric_value(day, metric) for day in days]
 
 
-def _period_average(values: list[float | None]) -> float | None:
-    nums = [v for v in values if v is not None]
-    if not nums:
+_PERIOD_VALUE_BASIS = {
+    "cost": "average_daily_value",
+    "conversions": "average_daily_value",
+    "clicks": "average_daily_value",
+    "impressions": "average_daily_value",
+    "cost_per_conv": "weighted_by_conversions",
+    "cpc": "weighted_by_clicks",
+    "conv_rate": "weighted_by_clicks",
+    "ctr": "weighted_by_impressions",
+    "roas": "weighted_by_cost",
+}
+
+
+def _period_metric_value(days: list[dict], metric: str) -> float | None:
+    """One period-level metric value.
+
+    Volume metrics are average-daily values so the earlier/recent halves are
+    comparable when the split has an odd day count. Ratio metrics are weighted
+    from summed denominators, never averaged from daily ratios.
+    """
+    if not days:
         return None
-    return round(sum(nums) / len(nums), 4)
+
+    totals = google_ads_snapshot.zero_metrics()
+    for day in days:
+        google_ads_snapshot.accumulate(totals, day)
+
+    if metric in {"cost", "conversions", "clicks", "impressions"}:
+        return round((totals.get(metric) or 0) / len(days), 4)
+
+    derived = google_ads_snapshot.derive_metrics(totals)
+    if metric == "cost_per_conv":
+        return derived.get("cpa")
+    return derived.get(metric)
 
 
 def _campaign_trend_summary(
@@ -1401,15 +1456,15 @@ def _campaign_trend_summary(
     if not series:
         return None
     window = series[-chart_days:] if chart_days > 0 else series
-    values = _daily_metric_series(window, metric)
-    valid = [v for v in values if v is not None]
+    daily_values = _daily_metric_series(window, metric)
+    valid = [v for v in daily_values if v is not None]
     if not valid:
         return None
 
     midpoint = max(1, len(window) // 2)
-    earlier_avg = _period_average(values[:midpoint])
-    recent_avg = _period_average(values[midpoint:])
-    change_pct = google_ads_snapshot.pct_change(recent_avg, earlier_avg)
+    earlier_value = _period_metric_value(window[:midpoint], metric)
+    recent_value = _period_metric_value(window[midpoint:], metric)
+    change_pct = google_ads_snapshot.pct_change(recent_value, earlier_value)
     if change_pct is None:
         direction = "flat"
     elif change_pct > 2:
@@ -1425,12 +1480,13 @@ def _campaign_trend_summary(
         "days": len(window),
         "start": window[0].get("date"),
         "end": window[-1].get("date"),
-        "first_value": values[0],
-        "last_value": values[-1],
-        "min_value": min(valid),
-        "max_value": max(valid),
-        "earlier_avg": earlier_avg,
-        "recent_avg": recent_avg,
+        "first_daily_value": daily_values[0],
+        "last_daily_value": daily_values[-1],
+        "min_daily_value": min(valid),
+        "max_daily_value": max(valid),
+        "earlier_period_value": earlier_value,
+        "recent_period_value": recent_value,
+        "period_value_basis": _PERIOD_VALUE_BASIS.get(metric, "period_value"),
         "recent_vs_earlier_pct": change_pct,
         "direction": direction,
     }
@@ -1443,15 +1499,15 @@ def _daily_trend_summary(
     window = days[-max_days:] if max_days > 0 else days
     if not window:
         return None
-    values = _daily_metric_series(window, metric)
-    valid = [v for v in values if v is not None]
+    daily_values = _daily_metric_series(window, metric)
+    valid = [v for v in daily_values if v is not None]
     if not valid:
         return None
 
     midpoint = max(1, len(window) // 2)
-    earlier_avg = _period_average(values[:midpoint])
-    recent_avg = _period_average(values[midpoint:])
-    change_pct = google_ads_snapshot.pct_change(recent_avg, earlier_avg)
+    earlier_value = _period_metric_value(window[:midpoint], metric)
+    recent_value = _period_metric_value(window[midpoint:], metric)
+    change_pct = google_ads_snapshot.pct_change(recent_value, earlier_value)
     if change_pct is None:
         direction = "flat"
     elif change_pct > 2:
@@ -1466,12 +1522,13 @@ def _daily_trend_summary(
         "days": len(window),
         "start": window[0].get("date"),
         "end": window[-1].get("date"),
-        "first_value": values[0],
-        "last_value": values[-1],
-        "min_value": min(valid),
-        "max_value": max(valid),
-        "earlier_avg": earlier_avg,
-        "recent_avg": recent_avg,
+        "first_daily_value": daily_values[0],
+        "last_daily_value": daily_values[-1],
+        "min_daily_value": min(valid),
+        "max_daily_value": max(valid),
+        "earlier_period_value": earlier_value,
+        "recent_period_value": recent_value,
+        "period_value_basis": _PERIOD_VALUE_BASIS.get(metric, "period_value"),
         "recent_vs_earlier_pct": change_pct,
         "direction": direction,
     }
@@ -1555,6 +1612,54 @@ def _add_campaign_extras(
         c["trend_90d"] = _campaign_90d_summary(snapshot, campaign, use_roas)
 
 
+def _custom_range_digest(snapshot: dict, metric: str) -> dict:
+    """Slim model-facing fact pack for a custom date range.
+
+    No period-over-period deltas — only the absolute metrics for the window.
+    """
+    use_roas = metric == "roas"
+    account = snapshot.get("account") or {}
+    date_range = snapshot.get("date_range") or {}
+    totals = snapshot.get("account_totals") or {}
+
+    campaigns = [
+        _campaign_digest_row(c, use_roas)
+        for c in (snapshot.get("campaigns") or [])[:8]
+    ]
+
+    by_channel = {
+        channel: {
+            "campaign_count": agg.get("campaign_count"),
+            "period": _slim_metrics(agg.get("last_30") or {}, use_roas),
+        }
+        for channel, agg in (snapshot.get("by_channel") or {}).items()
+    }
+
+    return {
+        "account": {
+            "name": account.get("name"),
+            "customer_id": account.get("customer_id"),
+            "currency": account.get("currency"),
+        },
+        "period": {
+            "label": "custom range",
+            "start": date_range.get("start"),
+            "end": date_range.get("end"),
+            "days": date_range.get("days"),
+            "as_of": snapshot.get("as_of"),
+        },
+        "kind": "custom_range",
+        "account_totals": {
+            "period": _slim_metrics(totals.get("last_30") or {}, use_roas),
+        },
+        "by_channel": by_channel,
+        "campaign_count": snapshot.get("campaign_count"),
+        "campaigns": campaigns,
+        "other_campaigns": snapshot.get("other_campaigns"),
+        "note": "Custom date range — no period-over-period comparison available.",
+    }
+
+
 def _overview_digest(
     snapshot: dict,
     metric: str,
@@ -1635,6 +1740,12 @@ def _overview_digest(
         "campaigns": campaigns,
         "other_campaigns": snapshot.get("other_campaigns"),
     }
+    if trend_metric:
+        out["account_trend"] = _daily_trend_summary(
+            snapshot.get("daily_trend_90d") or [],
+            trend_metric,
+            max_days=chart_days,
+        )
     _add_digest_extras(out, snapshot, extras=requested_extras, use_roas=use_roas)
     return out
 
@@ -1711,6 +1822,14 @@ async def _get_google_ads_data(
     except (TypeError, ValueError):
         chart_days = 30
 
+    date_from = _parse_date_arg(inputs.get("date_from"))
+    date_to = _parse_date_arg(inputs.get("date_to"))
+
+    # A campaign reference no longer forces a drill — only an explicit drill
+    # scope does. A metric / trend question about a campaign is answered from
+    # the account_overview digest (which carries every campaign's deltas).
+    is_drill = scope in _DRILL_SCOPES
+
     try:
         client = await google_ads.GoogleAdsClient.for_user(user_id)
     except google_ads.GoogleAdsNotConnectedError:
@@ -1725,6 +1844,57 @@ async def _get_google_ads_data(
         return resolved  # error or needs_disambiguation — the agent relays it
     account = resolved
 
+    # ── Custom date range (account_overview only) ──────────────────────────
+    if date_from is not None and date_to is not None and not is_drill:
+        yesterday = date.today() - timedelta(days=1)
+        date_to = min(date_to, yesterday)
+        if date_from > date_to:
+            return {
+                "error": (
+                    f"date_from ({date_from}) must be on or before date_to "
+                    f"({date_to})."
+                )
+            }
+        if (date_to - date_from).days > 364:
+            return {"error": "Custom date ranges are limited to 365 days."}
+
+        custom_window = google_ads.DateWindow(
+            "custom", date_from, date_to
+        )
+        custom_key = (
+            user_id, channel_id, thread_ts, account.customer_id,
+            date_from.isoformat(), date_to.isoformat(),
+        )
+        try:
+            custom_snap = await google_ads_snapshot.get_or_build_custom_range(
+                user_id=user_id,
+                account=account,
+                window=custom_window,
+                cache_key=custom_key,
+            )
+        except google_ads.GoogleAdsNotConnectedError:
+            return {"error": "Google Ads isn't connected. Run /connect to link it."}
+        except Exception as exc:
+            logger.exception("Google Ads custom range fetch failed")
+            return {"error": f"Couldn't pull Google Ads data for that date range: {exc}"}
+
+        blocks = ads_blocks.account_overview_card(
+            custom_snap,
+            metric=metric,
+            include_change=False,
+            period_label="",
+        )
+        return {
+            "ok": True,
+            "kind": "custom_range",
+            "message": f"Google Ads — {account.name} ({date_from} to {date_to}).",
+            "fact_pack": _custom_range_digest(custom_snap, metric),
+            "blocks": blocks,
+            "images": [],
+            "_resolved_customer_id": account.customer_id,
+            "_resolved_account_name": account.name,
+        }
+
     snap_key = (user_id, channel_id, thread_ts, account.customer_id)
     try:
         snapshot = await google_ads_snapshot.get_or_build_snapshot(
@@ -1735,11 +1905,6 @@ async def _get_google_ads_data(
     except Exception as exc:
         logger.exception("Google Ads snapshot fetch failed")
         return {"error": f"Couldn't pull Google Ads data: {exc}"}
-
-    # A campaign reference no longer forces a drill — only an explicit drill
-    # scope does. A metric / trend question about a campaign is answered from
-    # the account_overview digest (which carries every campaign's deltas).
-    is_drill = scope in _DRILL_SCOPES
 
     if not is_drill:
         images: list[dict] = []
@@ -1790,7 +1955,7 @@ async def _get_google_ads_data(
             images = await _render_specs(specs)
         blocks = (
             None
-            if selected_campaign
+            if selected_campaign or include_charts
             else ads_blocks.account_overview_card(
                 snapshot, metric=metric, include_change=include_change
             )

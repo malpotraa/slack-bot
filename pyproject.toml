@@ -34,7 +34,7 @@ dependencies = [
     "dateparser>=1.2.0",
     "pytz>=2024.2",
     # Observability
-    "arize-phoenix-otel>=0.7.0",
+    "braintrust>=0.0.170",
     "openinference-instrumentation-anthropic>=0.1.14",
     "openinference-semantic-conventions>=0.1.14",
     "opentelemetry-api>=1.28.2",

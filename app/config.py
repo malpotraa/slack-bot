@@ -62,14 +62,16 @@ class Settings(BaseSettings):
     wrike_client_id: str = ""
     wrike_client_secret: str = ""
 
-    # ── Phoenix ──
-    phoenix_collector_endpoint: str = "https://app.phoenix.arize.com"
-    phoenix_project_name: str = "slack-assistant"
-    phoenix_api_key: str = ""
+    # ── Braintrust ──
+    braintrust_api_key: str = ""
+    braintrust_project: str = "pronto-ads-analyst"
     # false (default): trace prompts, tool names/args and replies in full, but
     # mask the VALUES in tool responses (shape + types only). true: trace
     # everything raw, incl. user email + Anthropic SDK auto-instrumentation.
     trace_sensitive_data: bool = False
+    # When true, every successful Google Ads agent turn is captured as a row
+    # in the Braintrust "ads-analyst-turns" dataset (for systematic evals).
+    eval_capture: bool = False
 
     # ── Defaults ──
     default_workday_start: str = "09:00"

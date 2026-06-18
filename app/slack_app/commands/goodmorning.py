@@ -196,7 +196,7 @@ def register(app):
                 missing_providers.append("slack_user")
 
             with start_span("command.goodmorning", kind=Kind.CHAIN) as span:
-                # Rich attributes for Phoenix
+                # Rich attributes for Braintrust
                 span.set_attribute("user.id", slack_user_id)
                 span.set_attribute("user.name", real_name or "")
                 if email and settings.trace_sensitive_data:
@@ -286,6 +286,6 @@ def register(app):
                 ts=loading_ts,
                 text=(
                     "⚠️ Couldn't build the briefing this time. "
-                    "Trace is in Phoenix; try again in a moment."
+                    "Trace is in Braintrust; try again in a moment."
                 ),
             )

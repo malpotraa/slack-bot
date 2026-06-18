@@ -153,7 +153,7 @@ def section_cover(doc: Document) -> None:
         doc,
         "Step-by-step instructions to deploy the multi-user Slack assistant to "
         "Google Cloud Run, including all third-party app setup (Slack, Google, Wrike, "
-        "Anthropic, Phoenix). Written for a careful follower.",
+        "Anthropic, Braintrust). Written for a careful follower.",
     )
     add_para(doc, "Deployment target:  Google Cloud Run + Cloud SQL Postgres")
     add_para(doc, "Estimated cost:      ~$20–25 / month (excluding Anthropic API usage)")
@@ -209,13 +209,13 @@ def section_overview(doc: Document) -> None:
         doc,
         [
             "Sign up for or sign in to all the third-party services (Slack, Google, "
-            "Wrike, Anthropic, Phoenix). Section 2.",
+            "Wrike, Anthropic, Braintrust). Section 2.",
             "Install command-line tools on your laptop (gcloud, uv, git). Section 3.",
             "Create the Slack app and get its tokens. Section 4.",
             "Create the Google OAuth client. Section 5.",
             "Create the Wrike OAuth app. Section 6.",
             "Create the Anthropic API key. Section 7.",
-            "Sign up for Phoenix Cloud. Section 8.",
+            "Sign up for Braintrust. Section 8.",
             "Create the Google Cloud project and enable APIs. Section 9.",
             "Create the Cloud SQL Postgres database. Section 10.",
             "Upload all secrets to Google Secret Manager. Section 11.",
@@ -238,7 +238,7 @@ def section_overview(doc: Document) -> None:
         "                          │  via Auth Proxy     │\n"
         "                          └─────────────────────┘\n"
         "                          ┌─────────────────────┐\n"
-        "                          │  Phoenix Cloud      │◄── traces (OTel)\n"
+        "                          │  Braintrust         │◄── traces (OTel)\n"
         "                          └─────────────────────┘\n"
         "                          ┌─────────────────────┐\n"
         "                          │  Secret Manager     │\n"
@@ -255,7 +255,7 @@ def section_overview(doc: Document) -> None:
             "~$10–15 a month at this size.",
             "Cloud SQL Postgres is a managed database. Backups, patching, and security all "
             "handled by Google. Cheapest tier (db-f1-micro) is enough for hundreds of users.",
-            "Phoenix Cloud's free tier removes infrastructure work for observability.",
+            "Braintrust's free tier removes infrastructure work for observability.",
             "Secret Manager keeps API keys out of source control and out of environment "
             "variables in the console UI.",
         ],
@@ -277,7 +277,7 @@ def section_accounts(doc: Document) -> None:
         ("Google Cloud", "https://console.cloud.google.com — sign in with a Google account", "$300 free trial credit on first sign-up"),
         ("Wrike", "https://www.wrike.com — sign up for a free trial", "Free trial; OAuth app creation needs Wrike admin"),
         ("Anthropic", "https://console.anthropic.com", "Free to sign up; pay-as-you-go for API"),
-        ("Phoenix (Arize)", "https://app.phoenix.arize.com", "Free tier"),
+        ("Braintrust", "https://www.braintrust.dev", "Free tier"),
     ]
     add_kv_table(doc, list(rows[0]), rows[1:])
 
@@ -702,25 +702,23 @@ def section_anthropic(doc: Document) -> None:
     page_break(doc)
 
 
-def section_phoenix(doc: Document) -> None:
-    add_h1(doc, "8. Sign up for Phoenix Cloud")
+def section_braintrust(doc: Document) -> None:
+    add_h1(doc, "8. Sign up for Braintrust")
 
     add_para(
         doc,
-        "Phoenix is the observability tool that records every model call and tool call so "
-        "you can debug what the assistant did. The Cloud free tier is plenty for a small "
-        "team.",
+        "Braintrust is the observability and eval tool that records model and tool spans "
+        "so you can debug what the assistant did. The free tier is plenty for a small team.",
     )
 
     add_numbered(
         doc,
         [
-            "Sign up at https://app.phoenix.arize.com.",
+            "Sign up at https://www.braintrust.dev.",
             "After confirming your email, you'll land on the dashboard.",
             "Top right → your name → 'Settings' (or 'API Keys').",
-            "Click 'Create API Key'. Copy it. Save as PHOENIX_API_KEY.",
-            "Note the collector endpoint — typically https://app.phoenix.arize.com (the "
-            "default in our config).",
+            "Click 'Create API Key'. Copy it. Save as BRAINTRUST_API_KEY.",
+            "Create or choose the project name used by BRAINTRUST_PROJECT.",
         ],
     )
     page_break(doc)
@@ -853,7 +851,7 @@ def section_secrets(doc: Document) -> None:
         "GOOGLE_CLIENT_SECRET=\"…\"\n"
         "WRIKE_CLIENT_ID=\"…\"\n"
         "WRIKE_CLIENT_SECRET=\"…\"\n"
-        "PHOENIX_API_KEY=\"…\"\n"
+        "BRAINTRUST_API_KEY=\"…\"\n"
         "APP_SECRET_KEY=\"…\"\n"
         "TOKEN_ENCRYPTION_KEY=\"…\"\n"
         "DATABASE_URL=\"postgresql+asyncpg://app:…@/slack_assistant?host=/cloudsql/PROJECT:REGION:slack-assistant-pg\"",
@@ -1101,8 +1099,8 @@ def section_agent_behavior(doc: Document) -> None:
     add_h2(doc, "14.5 Observability")
     add_para(
         doc,
-        "Every conversation, tool call, and result is recorded in Phoenix Cloud "
-        "(at PHOENIX_COLLECTOR_ENDPOINT). Each trace is tagged with the user's "
+        "Every conversation, tool call, and result is recorded in Braintrust. "
+        "Each trace is tagged with the user's "
         "real Slack name, email, and the channel/thread ID — useful when "
         "debugging 'why did the bot say X to user Y'. Sessions group by Slack "
         "thread so a single trace covers a whole conversation.",
@@ -1170,15 +1168,13 @@ def section_troubleshooting(doc: Document) -> None:
         ],
     )
 
-    add_h2(doc, "15.6 Phoenix shows '401 Unauthorized' for trace exports")
+    add_h2(doc, "15.6 Braintrust traces are missing or unauthorized")
     add_bullets(
         doc,
         [
-            "PHOENIX_API_KEY is missing or wrong. Re-copy from app.phoenix.arize.com → Settings.",
-            "PHOENIX_COLLECTOR_ENDPOINT can be either the bare host "
-            "(`https://app.phoenix.arize.com`) or your space URL "
-            "(`https://app.phoenix.arize.com/s/<your-space>`). The code accepts both.",
-            "After updating either, redeploy: ./infrastructure/04-build-and-deploy.sh --no-build",
+            "BRAINTRUST_API_KEY is missing or wrong. Re-copy it from Braintrust settings.",
+            "BRAINTRUST_PROJECT must match the project you want traces routed to.",
+            "After updating either value, redeploy: ./infrastructure/04-build-and-deploy.sh --no-build",
         ],
     )
 
@@ -1334,7 +1330,7 @@ def section_appendix(doc: Document) -> None:
             ("WRIKE_CLIENT_ID", "Wrike → OAuth apps → your app", "Secret Manager"),
             ("WRIKE_CLIENT_SECRET", "Wrike → OAuth apps → your app", "Secret Manager"),
             ("ANTHROPIC_API_KEY", "console.anthropic.com → API Keys", "Secret Manager"),
-            ("PHOENIX_API_KEY", "app.phoenix.arize.com → Settings", "Secret Manager"),
+            ("BRAINTRUST_API_KEY", "Braintrust → Settings", "Secret Manager"),
             ("APP_SECRET_KEY", "scripts/gen_keys.py output", "Secret Manager"),
             ("TOKEN_ENCRYPTION_KEY", "scripts/gen_keys.py output", "Secret Manager"),
             ("DATABASE_URL", "Printed by 01-create-cloud-sql.sh", "Secret Manager"),
@@ -1390,7 +1386,7 @@ def build() -> Path:
     section_google(doc)
     section_wrike(doc)
     section_anthropic(doc)
-    section_phoenix(doc)
+    section_braintrust(doc)
     section_gcp_setup(doc)
     section_cloud_sql(doc)
     section_secrets(doc)

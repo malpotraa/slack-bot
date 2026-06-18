@@ -162,6 +162,7 @@ def account_overview_card(
     *,
     metric: str = "cost_per_conv",
     include_change: bool = False,
+    period_label: str | None = None,
 ) -> list[dict]:
     account = snapshot.get("account") or {}
     currency = account.get("currency")
@@ -171,7 +172,8 @@ def account_overview_card(
     rng = _format_range(window)
     header = f"📊 *Google Ads — {name}*"
     if rng:
-        header += f" · {rng} (last 30 days)"
+        label = period_label if period_label is not None else "last 30 days"
+        header += f" · {rng} ({label})" if label else f" · {rng}"
     blocks: list[dict] = [_section(header)]
 
     by_channel = snapshot.get("by_channel") or {}

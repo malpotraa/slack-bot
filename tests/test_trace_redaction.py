@@ -1,4 +1,4 @@
-"""Structural redaction for Phoenix tool-response tracing."""
+"""Structural redaction for Braintrust tool-response tracing."""
 
 from app.observability import redact_values
 

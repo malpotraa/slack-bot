@@ -486,3 +486,139 @@ async def get_or_build_snapshot(
         pack = await _fetch_snapshot(user_id, account)
         _SNAPSHOT_CACHE.set(cache_key, pack)
         return pack
+
+
+# ── Custom date-range snapshot (short TTL — window-specific) ──────────────
+
+_CUSTOM_RANGE_CACHE: TTLCache[tuple, dict[str, Any]] = TTLCache(
+    maxsize=32, ttl_seconds=5 * 60
+)
+_CUSTOM_RANGE_LOCKS = KeyedLocks(maxsize=64)
+
+
+def build_custom_range_pack(
+    account: GoogleAdsAccount,
+    window: DateWindow,
+    daily_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate raw campaign daily rows for an arbitrary date window.
+
+    The result maps custom-period metrics into the `last_30` slot so
+    `account_overview_card` renders it without changes to the table logic.
+    No period-over-period comparison is computed.
+    """
+    campaigns: dict[str, dict[str, Any]] = {}
+    for row in daily_rows:
+        cid = row.get("campaign_id") or ""
+        if not cid:
+            continue
+        camp = campaigns.setdefault(
+            cid,
+            {
+                "campaign_id": cid,
+                "name": row.get("name") or f"Campaign {cid}",
+                "channel": row.get("channel") or "UNKNOWN",
+                "status": row.get("status") or "",
+                "totals": zero_metrics(),
+            },
+        )
+        for key in ("name", "status", "channel"):
+            if row.get(key):
+                camp[key] = row[key]
+        accumulate(camp["totals"], row)
+
+    by_channel: dict[str, Any] = {}
+    for camp in campaigns.values():
+        ch = camp["channel"] or "UNKNOWN"
+        grp = by_channel.setdefault(ch, {"totals": zero_metrics(), "count": 0})
+        for k in METRIC_KEYS:
+            grp["totals"][k] += camp["totals"][k]
+        grp["count"] += 1
+
+    account_total = zero_metrics()
+    for camp in campaigns.values():
+        for k in METRIC_KEYS:
+            account_total[k] += camp["totals"][k]
+
+    campaign_rows: list[dict[str, Any]] = [
+        {
+            "campaign_id": cid,
+            "name": camp["name"],
+            "channel": camp["channel"],
+            "status": camp["status"],
+            "last_30": derive_metrics(camp["totals"]),
+        }
+        for cid, camp in campaigns.items()
+    ]
+    campaign_rows.sort(key=lambda c: -(c["last_30"]["cost"] or 0))
+
+    shown = campaign_rows[:_TOP_CAMPAIGNS]
+    tail = campaign_rows[_TOP_CAMPAIGNS:]
+    other_campaigns: dict[str, Any] | None = None
+    if tail:
+        other_campaigns = {
+            "count": len(tail),
+            "last_30_cost": round(sum(c["last_30"]["cost"] or 0 for c in tail), 2),
+            "last_30_conversions": round(
+                sum(c["last_30"]["conversions"] or 0 for c in tail), 2
+            ),
+        }
+
+    days = (window.end - window.start).days + 1
+    return {
+        "account": {
+            "name": account.name,
+            "customer_id": account.customer_id,
+            "currency": account.currency_code,
+            "time_zone": account.time_zone,
+        },
+        "as_of": window.end.isoformat(),
+        "windows": {
+            "last_30": {"start": window.start.isoformat(), "end": window.end.isoformat()},
+        },
+        "account_totals": {
+            "last_30": derive_metrics(account_total),
+        },
+        "by_channel": {
+            ch: {
+                "campaign_count": grp["count"],
+                "last_30": derive_metrics(grp["totals"]),
+            }
+            for ch, grp in by_channel.items()
+        },
+        "campaigns": shown,
+        "other_campaigns": other_campaigns,
+        "campaign_count": len(campaign_rows),
+        "kind": "custom_range",
+        "date_range": {
+            "start": window.start.isoformat(),
+            "end": window.end.isoformat(),
+            "days": days,
+        },
+    }
+
+
+async def get_or_build_custom_range(
+    *,
+    user_id: int,
+    account: GoogleAdsAccount,
+    window: DateWindow,
+    cache_key: tuple,
+) -> dict[str, Any]:
+    """Return a cached custom-range snapshot or build a fresh one.
+
+    Uses a shorter TTL than the rolling snapshot because the window is
+    user-specified and typically a current-month slice that changes daily.
+    """
+    cached = _CUSTOM_RANGE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    async with _CUSTOM_RANGE_LOCKS.get(cache_key):
+        cached = _CUSTOM_RANGE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        client = await GoogleAdsClient.for_user(user_id)
+        daily_rows = await client.campaign_daily_metrics(account.customer_id, window)
+        pack = build_custom_range_pack(account, window, daily_rows)
+        _CUSTOM_RANGE_CACHE.set(cache_key, pack)
+        return pack

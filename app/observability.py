@@ -1,13 +1,13 @@
-"""Phoenix / OpenTelemetry setup. Call configure_observability() once at startup.
+"""Braintrust / OpenTelemetry setup. Call configure_observability() once at startup.
 
-Works against either:
-  - Phoenix Cloud:  PHOENIX_COLLECTOR_ENDPOINT=https://app.phoenix.arize.com[/s/<space>]
-                    PHOENIX_API_KEY=<jwt>
-  - Self-host:      PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:6006   (no API key)
+Traces are exported to Braintrust via the standard OTLP HTTP exporter so the
+existing span hierarchy (agent.turn → agent.iteration → tool.*) is preserved.
+Set BRAINTRUST_API_KEY to enable; leave empty to run with a no-op tracer.
 
-We rely on `phoenix.otel.register()` to wire OTLP correctly: pass the API key via
-its `api_key=` parameter (it adds the `authorization: Bearer …` header itself),
-pass the bare base URL as `endpoint=`, and let it append `/v1/traces`.
+Redaction policy (enforced in runner._trace_tool_output):
+  - User prompts, tool names/args, and assistant replies → traced in full.
+  - Tool RESPONSES (Google Ads / Calendar / Wrike data) → shape + types only
+    (values masked via redact_values) unless TRACE_SENSITIVE_DATA=true.
 """
 
 from __future__ import annotations
@@ -23,57 +23,49 @@ from app.config import settings
 _tracer = None
 
 
-def _phoenix_endpoint(raw: str) -> str:
-    """Return a base URL ending with `/v1/traces` for the OTLP HTTP exporter."""
-    base = raw.rstrip("/")
-    if base.endswith("/v1/traces"):
-        return base
-    return f"{base}/v1/traces"
-
-
 def configure_observability() -> None:
-    """Register Phoenix tracer + auto-instrument Anthropic SDK."""
+    """Register Braintrust OTEL tracer + optionally auto-instrument Anthropic SDK."""
     global _tracer
 
-    if not settings.phoenix_collector_endpoint:
-        logger.info("PHOENIX_COLLECTOR_ENDPOINT empty; tracing disabled")
+    if not settings.braintrust_api_key:
+        logger.info("BRAINTRUST_API_KEY empty; tracing disabled")
         return
 
     try:
-        from phoenix.otel import register
+        from opentelemetry import trace as otel_trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
     except ImportError:
-        logger.warning("arize-phoenix-otel not installed; tracing disabled")
+        logger.warning("opentelemetry packages not installed; tracing disabled")
         return
 
-    endpoint = _phoenix_endpoint(settings.phoenix_collector_endpoint)
-    api_key = settings.phoenix_api_key or None
-
-    tracer_provider = register(
-        project_name=settings.phoenix_project_name,
-        endpoint=endpoint,
-        api_key=api_key,
-        auto_instrument=False,
-        set_global_tracer_provider=True,
-        protocol="http/protobuf",
-        verbose=False,
+    exporter = OTLPSpanExporter(
+        endpoint="https://api.braintrust.dev/otel/v1/traces",
+        headers={
+            "Authorization": f"Bearer {settings.braintrust_api_key}",
+            # Routes traces to the correct Braintrust project.
+            "x-bt-project": settings.braintrust_project,
+        },
     )
+    resource = Resource(attributes={"service.name": "slack-assistant"})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    otel_trace.set_tracer_provider(provider)
 
-    try:
-        from openinference.instrumentation.anthropic import AnthropicInstrumentor
+    if settings.trace_sensitive_data:
+        try:
+            from openinference.instrumentation.anthropic import AnthropicInstrumentor
 
-        if settings.trace_sensitive_data:
-            AnthropicInstrumentor().instrument(tracer_provider=tracer_provider)
-        else:
-            logger.info("Anthropic auto-instrumentation skipped; TRACE_SENSITIVE_DATA=false")
-    except Exception as exc:  # pragma: no cover
-        logger.warning(f"Anthropic instrumentation skipped: {exc}")
+            AnthropicInstrumentor().instrument(tracer_provider=provider)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Anthropic instrumentation skipped: {exc}")
+    else:
+        logger.info("Anthropic auto-instrumentation skipped; TRACE_SENSITIVE_DATA=false")
 
-    _tracer = tracer_provider.get_tracer("slack-assistant")
-    auth_label = "with API key" if api_key else "no auth (self-host)"
-    logger.info(
-        f"Phoenix tracer registered → {endpoint} "
-        f"(project={settings.phoenix_project_name}, {auth_label})"
-    )
+    _tracer = provider.get_tracer("slack-assistant")
+    logger.info(f"Braintrust tracer registered (project={settings.braintrust_project})")
 
 
 def get_tracer():
@@ -92,7 +84,7 @@ def start_span(
     attributes: dict[str, Any] | None = None,
 ) -> ContextManager[Span]:
     """Start a current span tagged with the right OpenInference kind so it
-    renders correctly in the Phoenix UI (Agent / Chain / Tool / LLM …
+    renders correctly in Braintrust (Agent / Chain / Tool / LLM …
     instead of "unknown").
 
     Wraps `tracer.start_as_current_span` directly — returns whatever the

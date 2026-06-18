@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # Bump on intentional prompt revisions so traces can attribute behaviour
 # changes. Surfaced as the `agent.prompt_version` span attribute.
-PROMPT_VERSION = "2.6.0-2026-05-21"
+PROMPT_VERSION = "2.9.0-2026-05-24"
 
 
 # The STATIC system prompt — no per-turn values, so it caches cleanly across
@@ -119,6 +119,12 @@ works for every campaign type (Search, Shopping, Performance Max, Demand Gen,
 Video, Display).
   • ABSOLUTE: call get_google_ads_data on EVERY Google Ads question, including
     follow-ups like "graph it", "what about trend?", "how about Search?".
+    This includes challenges about a previous Ads answer ("why did you give
+    me this data?", "isn't there a guard?", "where did that percentage come
+    from?"). Do NOT self-diagnose a prior answer as fabricated, invented, or
+    absent from the tool output unless a current get_google_ads_data result
+    proves that. If the current fact_pack cannot verify the prior number, say
+    you can't verify it from the current turn and re-pull the requested metric.
     You never retain Google Ads data between turns; the prior fact_pack is NOT
     in the conversation. State numbers ONLY from the fact_pack returned in
     THIS turn. Never answer Ads numbers from memory or earlier messages.
@@ -135,6 +141,19 @@ Video, Display).
     when the user explicitly asks to break a campaign DOWN — its ad groups,
     keywords, ads, products or asset groups. A metric question is NOT a drill.
   • needs_disambiguation → list the candidates, ask, call again.
+  • DATE RANGES — the tool supports two modes:
+    Rolling windows (no date_from/date_to): last 30 days, last 7 days,
+    prior 30, last 90, week-over-week, year-over-year.
+    Custom ranges (pass date_from + date_to, YYYY-MM-DD): use whenever the
+    user asks for a specific calendar period. Resolve from TODAY in context:
+      - "this month"  → date_from = first day of current month, date_to = TODAY
+      - "last month"  → date_from = first day of prior month, date_to = last day
+      - "May 1–20"    → date_from="YYYY-05-01", date_to="YYYY-05-20"
+      - "21st to 30th"→ infer current month; use date_from and date_to
+    date_to is clamped to yesterday automatically — you can pass TODAY safely.
+    Custom ranges have NO period-over-period comparison; say so if the user
+    asks for a delta. NEVER frame rolling-window data as a calendar-month
+    equivalent or re-label it as "May 1–X equivalent".
   • metric: leave default (cost_per_conv). Pass metric='roas' ONLY if the
     user explicitly asks about ROAS / return on ad spend.
   • include_charts: leave FALSE. Set true ONLY when the user explicitly asks

@@ -9,12 +9,16 @@ Latency optimizations baked in:
     multi-step write flows (list → update_preview → speak) ran out of headroom
     when the model defensively re-listed before the update.
 
-Phoenix tracing remains rich: per-turn span, per-tool span, full input/output.
+Braintrust tracing: per-turn span, per-tool span, full input/output. Tool
+responses are structurally redacted (shape + types, values masked) unless
+TRACE_SENSITIVE_DATA=true. Eval capture is separate — see app/evals/capture.py.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -122,6 +126,149 @@ def _set_usage_attrs(
             cache_write_tokens=cache_create_tokens,
         ),
     )
+
+
+async def _capture_ads_eval(
+    *,
+    user_message: str,
+    reply: str,
+    ads_result: dict,
+    tool_name: str,
+    tool_args: dict,
+    cost_usd: float,
+    thread_ts: str,
+) -> None:
+    """Fire-and-forget eval capture — runs in a thread to avoid blocking the turn."""
+    try:
+        from app.evals.capture import capture_ads_turn
+
+        await asyncio.to_thread(
+            capture_ads_turn,
+            user_message=user_message,
+            reply=reply,
+            fact_pack=ads_result.get("fact_pack") or {},
+            tool_name=tool_name,
+            tool_args=tool_args,
+            prompt_version=PROMPT_VERSION,
+            cost_usd=cost_usd,
+            thread_ts=thread_ts,
+        )
+    except Exception as exc:
+        logger.warning(f"eval capture failed (non-fatal): {exc}")
+
+
+_ADS_FOCUS_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("conversion rate", "conv_rate"),
+    ("conv. rate", "conv_rate"),
+    ("conv rate", "conv_rate"),
+    ("cv rate", "conv_rate"),
+    ("ctr", "ctr"),
+    ("click through rate", "ctr"),
+    ("click-through rate", "ctr"),
+    ("cpc", "cpc"),
+    ("cost per click", "cpc"),
+    ("cost/conv", "cost_per_conv"),
+    ("cost per conversion", "cost_per_conv"),
+    ("cpa", "cost_per_conv"),
+    ("conversions", "conversions"),
+    ("conversion", "conversions"),
+    ("clicks", "clicks"),
+    ("impressions", "impressions"),
+    ("spend", "cost"),
+    ("cost", "cost"),
+)
+
+
+def _extract_percentage_mentions(text: str) -> list[float]:
+    return [float(m) for m in re.findall(r"([+-]?\d+(?:\.\d+)?)\s*%", text)]
+
+
+def _near_pct(a: float, b: float, tol: float = 0.15) -> bool:
+    return abs(abs(a) - abs(b)) <= tol
+
+
+def _ads_fact_percentage_values(obj: Any, *, parent_metric: str | None = None) -> list[float]:
+    """Flatten percentages the Ads reply may quote from the current fact pack.
+
+    Google Ads fact packs store deltas as already-percent values (`*_pct`) and
+    rates as fractions (`conv_rate`, `ctr`, or trend values whose metric is a
+    rate). Convert both into display percentage numbers for reconciliation.
+    """
+    values: list[float] = []
+    if isinstance(obj, dict):
+        metric = obj.get("metric") if isinstance(obj.get("metric"), str) else parent_metric
+        for key, val in obj.items():
+            if isinstance(val, (dict, list)):
+                values.extend(_ads_fact_percentage_values(val, parent_metric=metric))
+            elif isinstance(val, (int, float)):
+                if key.endswith("_pct"):
+                    values.append(float(val))
+                elif key in {"conv_rate", "ctr"}:
+                    values.append(float(val) * 100)
+                elif metric in {"conv_rate", "ctr"} and key in {
+                    "first_daily_value",
+                    "last_daily_value",
+                    "min_daily_value",
+                    "max_daily_value",
+                    "earlier_period_value",
+                    "recent_period_value",
+                }:
+                    values.append(float(val) * 100)
+        return values
+    if isinstance(obj, list):
+        for item in obj:
+            values.extend(_ads_fact_percentage_values(item, parent_metric=parent_metric))
+    return values
+
+
+def _ads_reply_unverified_percentages(reply: str, fact_pack: dict) -> list[float]:
+    mentioned = _extract_percentage_mentions(reply)
+    if not mentioned:
+        return []
+    allowed = _ads_fact_percentage_values(fact_pack)
+    if not allowed:
+        return mentioned
+    return [pct for pct in mentioned if not any(_near_pct(pct, actual) for actual in allowed)]
+
+
+def _infer_ads_focus_metric(user_message: str, tool_input: dict[str, Any]) -> str | None:
+    """Best-effort sticky metric for follow-ups like "chart it"."""
+    chart_metrics = tool_input.get("chart_metrics")
+    if isinstance(chart_metrics, list):
+        for metric in chart_metrics:
+            if isinstance(metric, str) and metric:
+                return metric
+    if tool_input.get("metric") == "roas":
+        return "roas"
+
+    lower = user_message.casefold()
+    for needle, metric in _ADS_FOCUS_KEYWORDS:
+        if needle in lower:
+            return metric
+    return None
+
+
+def _infer_ads_focus_days(user_message: str, tool_input: dict[str, Any]) -> int | None:
+    """Best-effort sticky trend window for follow-ups like "chart it"."""
+    try:
+        chart_days = int(tool_input.get("chart_days") or 0)
+        if chart_days > 0:
+            return max(1, min(chart_days, 90))
+    except (TypeError, ValueError):
+        pass
+
+    extras = tool_input.get("extras")
+    lower = user_message.casefold()
+    if (isinstance(extras, list) and "90d" in extras) or any(
+        phrase in lower
+        for phrase in ("90 day", "90-day", "3 month", "three month", "quarter")
+    ):
+        return 90
+    if "7 day" in lower or "7-day" in lower or "last week" in lower:
+        return 7
+    if "30 day" in lower or "30-day" in lower or "month" in lower:
+        return 30
+    return None
 
 
 StreamCallback = Callable[[str], Awaitable[None]]
@@ -333,6 +480,10 @@ async def run_agent_turn(
         total_output_tokens = 0
         total_cache_read_tokens = 0
         total_cache_create_tokens = 0
+        # Eval capture: the last get_google_ads_data result before redaction.
+        _last_ads_result: dict | None = None
+        _last_ads_tool_name = ""
+        _last_ads_tool_args: dict = {}
 
         for iteration in range(max_tool_iterations):
             with start_span("agent.iteration", kind=Kind.CHAIN) as it_span:
@@ -392,6 +543,25 @@ async def run_agent_turn(
 
             if final.stop_reason != "tool_use" or not tool_uses:
                 final_text = "\n".join(p for p in text_parts if p).strip()
+                if _last_ads_result is not None:
+                    mismatches = _ads_reply_unverified_percentages(
+                        final_text or "", _last_ads_result.get("fact_pack") or {}
+                    )
+                    if mismatches:
+                        logger.warning(
+                            "Ads reply blocked: unverified percentage(s) "
+                            f"{mismatches} not found in current fact_pack"
+                        )
+                        final_text = (
+                            "I can't verify the percentage I was about to state "
+                            "against the current Google Ads fact pack, so I'm not "
+                            "going to send that analysis. Ask me to pull the metric "
+                            "again and I'll answer only from the returned data."
+                        )
+                        span.set_attribute(
+                            "agent.ads_reply_blocked_unverified_percentages",
+                            json.dumps(mismatches),
+                        )
                 # The assistant's reply is traced in full — it's the response
                 # that went out to the user.
                 span.set_attribute(
@@ -407,6 +577,22 @@ async def run_agent_turn(
                     cache_read_tokens=total_cache_read_tokens,
                     cache_create_tokens=total_cache_create_tokens,
                 )
+                if settings.eval_capture and _last_ads_result is not None:
+                    await _capture_ads_eval(
+                        user_message=user_message,
+                        reply=final_text or "",
+                        ads_result=_last_ads_result,
+                        tool_name=_last_ads_tool_name,
+                        tool_args=_last_ads_tool_args,
+                        cost_usd=estimate_cost_usd(
+                            settings.agent_model,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
+                            cache_read_tokens=total_cache_read_tokens,
+                            cache_write_tokens=total_cache_create_tokens,
+                        ),
+                        thread_ts=thread_ts,
+                    )
                 return (
                     final_text or "(no response)",
                     pending_actions,
@@ -504,6 +690,13 @@ async def run_agent_turn(
                                 or "Here's the result.",
                                 "blocks": result.get("blocks"),
                                 "images": result.get("images"),
+                                "tool_args": tool_input,
+                                "focus_metric": _infer_ads_focus_metric(
+                                    user_message, tool_input
+                                ),
+                                "focus_days": _infer_ads_focus_days(
+                                    user_message, tool_input
+                                ),
                                 "resolved_customer_id": result.get(
                                     "_resolved_customer_id"
                                 ),
@@ -524,6 +717,18 @@ async def run_agent_turn(
                         }
                         if posts_message:
                             model_result["output_posted_to_user"] = True
+
+                    # Capture the raw Ads result for evals before redaction.
+                    # Only capture turns with a real fact_pack — skip disambiguation.
+                    if (
+                        tool_name == "get_google_ads_data"
+                        and settings.eval_capture
+                        and isinstance(result, dict)
+                        and result.get("fact_pack")
+                    ):
+                        _last_ads_result = result
+                        _last_ads_tool_name = tool_name
+                        _last_ads_tool_args = tool_input
 
                     # Tool output is the bulk integration data — traced as
                     # shape + types only (values masked) unless the operator

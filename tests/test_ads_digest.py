@@ -214,6 +214,54 @@ def test_overview_digest_selected_campaign_trend_is_summarized_not_raw():
     assert "daily_by_campaign" not in d
 
 
+def test_overview_digest_account_trend_uses_weighted_rate_math():
+    snap = _snapshot()
+    snap["daily_trend_90d"] = [
+        {
+            "date": "2026-05-01",
+            "cost": 10.0,
+            "conversions": 1.0,
+            "clicks": 1,
+            "impressions": 100,
+        },
+        {
+            "date": "2026-05-02",
+            "cost": 10.0,
+            "conversions": 0.0,
+            "clicks": 99,
+            "impressions": 100,
+        },
+        {
+            "date": "2026-05-03",
+            "cost": 10.0,
+            "conversions": 10.0,
+            "clicks": 100,
+            "impressions": 100,
+        },
+        {
+            "date": "2026-05-04",
+            "cost": 10.0,
+            "conversions": 10.0,
+            "clicks": 100,
+            "impressions": 100,
+        },
+    ]
+
+    d = _overview_digest(
+        snap,
+        "cost_per_conv",
+        trend_metric="conv_rate",
+        chart_days=4,
+    )
+
+    trend = d["account_trend"]
+    assert trend["metric"] == "conv_rate"
+    assert trend["period_value_basis"] == "weighted_by_clicks"
+    assert trend["earlier_period_value"] == 0.01
+    assert trend["recent_period_value"] == 0.1
+    assert trend["direction"] == "up"
+
+
 def test_overview_digest_selected_campaign_excludes_unneeded_overview_sections():
     snap = _snapshot()
     campaigns = []
@@ -368,6 +416,51 @@ async def test_campaign_chart_request_suppresses_account_table(monkeypatch):
     assert out["images"]
     assert out["fact_pack"]["campaign"]["name"] == "Brand"
     assert out["fact_pack"]["campaign_trend"]["metric"] == "conv_rate"
+
+
+async def test_account_chart_request_suppresses_account_table_and_adds_trend(monkeypatch):
+    snap = _snapshot()
+    snap["daily_trend_90d"] = [
+        {
+            "date": f"2026-05-{d:02d}",
+            "cost": 100.0,
+            "conversions": float(d),
+            "clicks": 100,
+            "impressions": 1000,
+        }
+        for d in range(1, 11)
+    ]
+
+    async def fake_for_user(_user_id):
+        return _FakeAdsClient()
+
+    async def fake_snapshot(**_kwargs):
+        return snap
+
+    async def fake_render(_specs):
+        return [{"filename": "conv_rate.png", "png": b"png", "title": "chart"}]
+
+    monkeypatch.setattr("app.agent.tools.google_ads.GoogleAdsClient.for_user", fake_for_user)
+    monkeypatch.setattr("app.agent.tools.google_ads_snapshot.get_or_build_snapshot", fake_snapshot)
+    monkeypatch.setattr("app.agent.tools._render_specs", fake_render)
+
+    out = await _get_google_ads_data(
+        {
+            "customer_id": "123",
+            "scope": "account_overview",
+            "include_charts": True,
+            "chart_metrics": ["conv_rate"],
+            "chart_days": 10,
+        },
+        user_id=1,
+        channel_id="C",
+        thread_ts="T",
+    )
+
+    assert out["kind"] == "account_overview"
+    assert out["blocks"] is None
+    assert out["images"]
+    assert out["fact_pack"]["account_trend"]["metric"] == "conv_rate"
 
 
 async def test_campaign_metric_request_suppresses_account_table(monkeypatch):
