@@ -33,6 +33,11 @@ class User(SQLModel, table=True):
     tz: str | None = None  # e.g. "America/Los_Angeles"
     workday_start: str = "09:00"
     workday_end: str = "18:00"
+    # Opt-in daily /goodmorning briefing. Off by default — a user enables it
+    # for themselves via `/goodmorning subscribe` or the button on the briefing.
+    # `daily_briefing_time` is local HH:MM (24h) interpreted in the user's `tz`.
+    daily_briefing_enabled: bool = False
+    daily_briefing_time: str = "08:00"
     # Free-form user preferences (e.g. "I prefer 30-min focus blocks",
     # "always schedule on Wednesdays") that the assistant should keep in
     # mind across conversations. Edited via update_user_notes / cleared
