@@ -122,7 +122,6 @@ prod/
 │   ├── 03-create-artifact-registry.sh # Docker repo + service accounts + IAM
 │   ├── 04-build-and-deploy.sh        # Build image + deploy to Cloud Run
 │   ├── 05-update-secret.sh           # Helper to rotate a single secret
-│   ├── 06-create-cicd-trigger.sh     # Optional: wire Cloud Build to GitHub
 │   ├── 07-reset-db-schema.sh         # Wipe + recreate DB schema (dev/test only)
 │   ├── 08-migrate-add-connect-card.sh # Example migration helper
 │   └── 99-tear-down.sh               # Remove everything (typed-confirm)
@@ -445,7 +444,7 @@ This is a single-team internal tool. If you're collaborating:
    print('OK')
    "
    ```
-4. Open a PR against `main`. If you've wired up the Cloud Build GitHub trigger (`06-create-cicd-trigger.sh`), the PR description should reference the auto-deploy build ID.
+4. Open a PR against `main`. Deploys are manual — after merging, run `infrastructure/04-build-and-deploy.sh` to build and roll out to Cloud Run.
 
 ### Schema changes
 

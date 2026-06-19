@@ -4,7 +4,7 @@
 # Pass --no-build to skip the Cloud Build step (useful when only env vars changed).
 
 set -euo pipefail
-cd "$(dirname "$0")/.."     # cd to prod/ root so cloudbuild.yaml is in cwd
+cd "$(dirname "$0")/.."     # cd to repo root so cloudbuild.yaml is in cwd
 source infrastructure/_env.sh
 
 DO_BUILD=1
