@@ -16,6 +16,7 @@ from app.logging_setup import configure_logging
 from app.oauth.server import create_oauth_app
 from app.observability import configure_observability
 from app.slack_app.app import create_slack_app, run_socket_mode
+from app.slack_app.scheduler import start_briefing_scheduler
 from app.utils.http_client import close_shared_async_clients
 
 
@@ -67,6 +68,7 @@ async def amain() -> None:
     await cleanup_expired_rows()
 
     slack_app = create_slack_app()
+    scheduler = start_briefing_scheduler(slack_app.client)
 
     logger.info(f"Booting on {settings.app_env} | base_url={settings.app_base_url}")
 
@@ -98,6 +100,7 @@ async def amain() -> None:
         if t.get_name() != "shutdown-signal" and t.exception():
             logger.error(f"Task {t.get_name()} crashed: {t.exception()}")
 
+    scheduler.shutdown(wait=False)
     await dispose()
     await close_shared_async_clients()
     logger.info("Bye 👋")

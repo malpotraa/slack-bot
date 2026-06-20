@@ -71,3 +71,24 @@ async def get_user_by_slack_id(
 
 async def get_user(session: AsyncSession, user_id: int) -> User | None:
     return await session.get(User, user_id)
+
+
+async def list_daily_briefing_subscribers(session: AsyncSession) -> list[User]:
+    """Return every user who has opted in to the daily /goodmorning briefing."""
+    stmt = select(User).where(User.daily_briefing_enabled == True)  # noqa: E712
+    return list((await session.exec(stmt)).all())
+
+
+async def set_daily_briefing(
+    user: User, *, enabled: bool, time: str | None = None
+) -> None:
+    """Flip a user's daily-briefing opt-in. Pass `time` (HH:MM) to also set it.
+
+    The caller owns the session; the passed `user` must be attached to it.
+    """
+    user.daily_briefing_enabled = enabled
+    if time:
+        user.daily_briefing_time = time
+    elif not user.daily_briefing_time:
+        user.daily_briefing_time = "08:00"
+    user.updated_at = datetime.now(UTC)

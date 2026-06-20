@@ -33,6 +33,7 @@ dependencies = [
     "python-dateutil>=2.9.0",
     "dateparser>=1.2.0",
     "pytz>=2024.2",
+    "apscheduler>=3.10.4",
     # Observability
     "braintrust>=0.0.170",
     "openinference-instrumentation-anthropic>=0.1.14",
